@@ -20,6 +20,7 @@ struct RootView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     statusCard
                     deviceSection
+                    bindSection
                     initSection
                     logSection
                 }
@@ -136,6 +137,62 @@ struct RootView: View {
         }
     }
 
+    // MARK: - 绑定
+
+    /// 这一步是闸门。
+    /// 22:31 的实测说明：眼镜回 `BIND_STATUS_RESPONSE{isBound=0, errorCode=3}` 然后
+    /// 发 UNBIND 并断开。官方代码里 isBound=0 时它自己也会 `disconnect()`，
+    /// 只有 isBound=1 才 `postDelayed(..., 5000)` 去跑初始化。
+    /// 而首次连一台没记录过的设备，官方发的是 `BIND_USERDATA(2)`，不是 `BACK_LINK(1)`。
+    private var bindSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("绑定")
+                .font(.headline)
+
+            Text("眼镜先要认下这个账号，才肯执行命令。官方：本地没这台设备的记录 → 发「首次绑定」；有记录才发「回连」。我们第一次连，所以用首次绑定。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Text("账号")
+                    .font(.subheadline)
+                TextField("52673", text: $ble.userAccount)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.numberPad)
+                    .font(.subheadline)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    ble.sendBind(kind: 2)
+                } label: {
+                    Text("首次绑定")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button {
+                    ble.sendBind(kind: 1)
+                } label: {
+                    Text("回连")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            .font(.subheadline)
+            .disabled(ble.connectedName == nil)
+
+            Text("发送后看日志里的「★ 绑定响应」：isBound=1 才算过。errorCode=1 表示被别的账号占着。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
     // MARK: - 初始化握手
 
     /// P3 的核心区。
@@ -150,14 +207,14 @@ struct RootView: View {
             Text("初始化握手")
                 .font(.headline)
 
-            Text("先点「一键流程」——它按正确顺序先发全量初始化（绑定），等 2 秒再发亮度自检。绑定前发命令眼镜是直接丢的。")
+            Text("「一键流程」按官方时序走：首次绑定 → 等绑定响应 → isBound=1 后等 5 秒 → 发 21 步 → 2 秒后亮度自检。绑定不过就停，不硬推。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
             Button {
-                ble.runFullThenTest()
+                ble.runOfficialFlow()
             } label: {
-                Text("一键：全量初始化 → 亮度自检")
+                Text("一键：绑定 → 初始化 → 亮度自检")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -226,6 +283,10 @@ struct RootView: View {
             }
             .font(.subheadline)
             .disabled(!canSendInit)
+
+            Text("第 1 步是回连帧，只在「已绑定」时才有意义；没绑定就发它，眼镜会回 errorCode=3 然后断开（22:31 那次就是这样）。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
 
             if ble.initRunning {
                 HStack(spacing: 6) {

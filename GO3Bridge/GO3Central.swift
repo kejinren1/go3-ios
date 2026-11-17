@@ -191,7 +191,11 @@ final class GO3Central: NSObject, ObservableObject {
 
     /// 把一条 protobuf 消息发出去：按 MTU 算单包 payload 上限，切成 1..N 个包。
     private func sendPayload(_ payload: [UInt8], ch: CBCharacteristic, label: String) {
-        let perPacket = max(16, maxWriteLength(ch) - 14)   // 14 = 12B 包头 + 2B CRC
+        // 单包上限强制卡到 230B（总长 244B）——这是官方 App 的实际上限
+        // （Android MTU 247 − 3 = 244）。iOS 报 509B，但 281B 那种一次写进去
+        // 直接把连接写断了（22:31 实测："The connection has timed out unexpectedly"）。
+        // 固件的接收缓冲显然是按 244B 设计的，不要拿我们的 MTU 去赌它。
+        let perPacket = max(16, min(maxWriteLength(ch) - 14, 230))
         let seq = nextSeq()
         let parts = GO3Frame.packets(seq: seq, payload: payload, maxPayload: perPacket)
         for (i, pkt) in parts.enumerated() {
@@ -217,15 +221,103 @@ final class GO3Central: NSObject, ObservableObject {
         useRW2021 ? rwChar2021 : writeChar1001
     }
 
-    /// 一键流程：全量初始化 → 等 2 秒 → 自动发亮度自检。
-    /// 把「先绑定、后发命令」这个顺序固化进代码，不靠人记。
-    func runFullThenTest() {
+    // MARK: - 绑定（整个流程的闸门）
+
+    /// 绑定用的账号 id。官方取的是 `AccountInfo.userInfo.id`（安卓那个账号）。
+    /// 眼镜侧记的 boundUserId 要和它对上，所以保留原值 "52673"；
+    /// 如果眼镜说"已被其他账号绑定"，就在界面上改这里。
+    @Published var userAccount = "52673"
+
+    private enum Stage {
+        case idle
+        /// 已发绑定、等眼镜回 BIND_STATUS_RESPONSE
+        case waitingBind
+        /// 绑定成功，等 5 秒（官方 `postDelayed(..., 5000)`）
+        case waitingInit
+        case runningInit
+    }
+
+    private var stage: Stage = .idle
+
+    /// 造一条 `BLE_CONNECT_BIND`：
+    /// `Message{ f2=24, f27 = BleConnectBind{ f1=kind, f2=userAccount } }`。
+    /// kind = 2 是 BIND_USERDATA（首次绑定），kind = 1 是 BACK_LINK（回连）。
+    /// 官方 `sendBindConnectProtocol()` 就是按「本地有没有这台设备的记录」二选一，
+    /// 我们第一次连的时候本地当然没有记录 —— 所以要用 2。
+    private func bindPayload(kind: UInt8) -> [UInt8] {
+        var acc = Array(userAccount.utf8)
+        if acc.count > 100 { acc = Array(acc.prefix(100)) }
+        var inner: [UInt8] = [0x08, kind, 0x12, UInt8(acc.count & 0xFF)]
+        inner.append(contentsOf: acc)
+        var out: [UInt8] = [0x10, 0x18, 0xDA, 0x01]
+        // varint 长度
+        var n = inner.count
+        while n >= 0x80 {
+            out.append(UInt8((n & 0x7F) | 0x80))
+            n >>= 7
+        }
+        out.append(UInt8(n))
+        out.append(contentsOf: inner)
+        return out
+    }
+
+    /// 手动发绑定。kind: 2 = 首次绑定（BIND_USERDATA），1 = 回连（BACK_LINK）。
+    func sendBind(kind: UInt8) {
+        guard let ch = targetChannel else {
+            append("还没连上眼镜，先连接")
+            return
+        }
+        let name = kind == 2 ? "BIND_USERDATA(2) 首次绑定" : "BACK_LINK(1) 回连"
+        append("→ 发绑定：\(name)，userAccount=\"\(userAccount)\"")
+        sendPayload(bindPayload(kind: kind), ch: ch, label: "BLE_CONNECT_BIND \(name)")
+        stage = .waitingBind
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self = self, self.stage == .waitingBind else { return }
+            self.stage = .idle
+            self.append("6 秒内没等到绑定响应。眼镜可能直接忽略了这条绑定。")
+        }
+    }
+
+    /// 完整流程，严格按官方顺序：
+    /// 发 BIND_USERDATA → 等 BIND_STATUS_RESPONSE → isBound=1 → 等 5 秒 → 发 21 步 → 等 2 秒 → 亮度自检。
+    /// 绑定失败就停，不再往下发——22:31 那次就是在未绑定状态硬推初始化，
+    /// 结果眼镜回 UNBIND 并断开，屏幕上显示"连接失败"。
+    func runOfficialFlow() {
         guard connectedPeripheral?.state == .connected, targetChannel != nil else {
             append("一键流程要先连上眼镜")
             return
         }
         testAfterInit = true
-        sendInit(firstOnly: false)
+        append("—— 一键流程开始 ——")
+        sendBind(kind: 2)
+    }
+
+    /// 处理眼镜回的绑定消息。照抄官方 `BleProtocolManager` 的分支：
+    /// isBound=1 → `postDelayed(5000)` 后才跑初始化；isBound=0 → 它自己调 disconnect()。
+    private func handleBindReport(_ rep: BindReport) {
+        switch rep.msgType {
+        case 3: // BIND_STATUS_RESPONSE
+            if rep.isBound {
+                append("  → 绑定成功。按官方时序等 5 秒再发初始化。")
+                guard stage == .waitingBind else { return }
+                stage = .waitingInit
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self = self, self.stage == .waitingInit else { return }
+                    self.append("  → 5 秒到，开始发初始化")
+                    self.sendInit(firstOnly: false)
+                }
+            } else {
+                append("  → 绑定未通过：\(rep.hint)")
+                append("  → 先别发初始化。官方在未绑定状态下会直接断开，硬发只会把连接搞崩。")
+                if stage == .waitingBind { stage = .idle }
+                testAfterInit = false
+            }
+        case 6: // UNBIND
+            append("  → 眼镜发来 UNBIND（解绑/未授权），需要重新绑定。")
+            if stage == .waitingBind { stage = .idle }
+        default:
+            break
+        }
     }
 
     /// 一次只发一段。无响应写没有回调，靠 20ms 让出主线程再发下一段；
@@ -284,6 +376,7 @@ final class GO3Central: NSObject, ObservableObject {
             append("已跳过第 \(InitSequence.skippedIdx) 步（原始数据标了含猜测字段）")
         }
         initRunning = true
+        stage = .runningInit
         sendStep(list, 0, ch, 0)
     }
 
@@ -294,6 +387,7 @@ final class GO3Central: NSObject, ObservableObject {
             initRunning = false
             queue.removeAll()
             writing = false
+            stage = .idle
             append("连接已断，初始化中止（已排到第 \(i)/\(list.count) 步）")
             return
         }
@@ -314,6 +408,7 @@ final class GO3Central: NSObject, ObservableObject {
                 return
             }
             initRunning = false
+            stage = .idle
             append("初始化发送完毕（\(list.count) 步）")
             if testAfterInit {
                 testAfterInit = false
@@ -447,6 +542,7 @@ extension GO3Central: CBCentralManagerDelegate {
         writing = false
         seqCounter = 1
         testAfterInit = false
+        stage = .idle
     }
 }
 
@@ -520,6 +616,12 @@ extension GO3Central: CBPeripheralDelegate {
             }
             append(line)
             append("       \(hex(d))")
+
+            // 绑定消息单独解成人话，并驱动流程往下走。
+            if let rep = BindReport.decode(f.payload) {
+                append("  ★ \(rep.summary)")
+                handleBindReport(rep)
+            }
         } else {
             append("  ← \(short(characteristic.uuid))  \(d.count)B  \(hex(d))")
         }
