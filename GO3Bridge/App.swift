@@ -27,6 +27,10 @@ struct RootView: View {
             .navigationTitle("GO3 Bridge")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("复制日志") { ble.copyLog() }
+                        .disabled(ble.log.isEmpty)
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(ble.scanning ? "停止" : "扫描") {
                         if ble.scanning {
