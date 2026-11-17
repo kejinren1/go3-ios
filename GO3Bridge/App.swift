@@ -133,23 +133,59 @@ struct RootView: View {
     // MARK: - 初始化握手
 
     /// P3 的核心区。
-    /// 眼镜现在会响"连接成功"的音效，但屏幕上一直提示「下载 INMO App」——
-    /// 因为 BLE 只是连上了，App 一个字节都没回过，眼镜不认这个对端。
-    /// 这里就把官方 App 开机时发的那串初始化帧补上。
+    /// 眼镜会响"连接成功"的音效，但屏幕一直提示「下载 INMO App」——
+    /// 因为 BLE 只是连上了，App 一个字节都没回，眼镜不认这个对端。
+    ///
+    /// 上一版发出去没用，原因已查明：`INTEL/app_init_wire.json` 里的帧是
+    /// 早前按「接收方向」模板合成的，`src=1 dst=3`（眼镜→手机）。
+    /// 把对方说的话原样念回给它听，它当然不理。官方真正发出的是 `type=0x00 src=3 dst=1`。
     private var initSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("初始化握手")
                 .font(.headline)
 
-            Text("眼镜连上后仍在提示「下载 INMO App」，是因为它没收到 App 的初始化序列。动作按钮会把官方 App 开机时发的帧重放一遍。")
+            Text("先点「投递自检」——它发的是官方真实抓到的「亮度 30」命令，效果立刻可见。屏幕变了，才说明通道和信封都对；这一步不过，后面发初始化没有意义。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+
+            Button {
+                ble.sendBrightnessTest()
+            } label: {
+                Text("投递自检：把亮度设成 30")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!canSendInit)
+
+            Divider()
 
             Toggle(isOn: $ble.useRW2021) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(ble.useRW2021 ? "写通道：2021" : "写通道：1001")
                         .font(.subheadline)
                     Text(ble.useRW2021 ? "read+write+writeNR，与通知 2022 同服务" : "7033 服务下的 writeNR")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(ble.initRunning)
+
+            Toggle(isOn: $ble.useWriteResponse) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ble.useWriteResponse ? "写类型：带回执(write)" : "写类型：无回执(writeNR)")
+                        .font(.subheadline)
+                    Text("无回执是官方做法；若眼镜完全不理，切这个再试")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(ble.initRunning)
+
+            Toggle(isOn: $ble.keepVersionPrefix) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ble.keepVersionPrefix ? "带 08 01 版本前缀" : "不带版本前缀（默认）")
+                        .font(.subheadline)
+                    Text("官方发出的 95 条帧都没有 version 字段，所以默认不带；不生效再打开")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -163,8 +199,7 @@ struct RootView: View {
                     Text("只发第 1 步")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(!canSendInit)
+                .buttonStyle(.bordered)
 
                 Button {
                     ble.sendInit(firstOnly: false)
@@ -173,9 +208,9 @@ struct RootView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(!canSendInit)
             }
             .font(.subheadline)
+            .disabled(!canSendInit)
 
             if ble.initRunning {
                 HStack(spacing: 6) {
@@ -188,7 +223,7 @@ struct RootView: View {
             } else {
                 Text(ble.connectedName == nil
                      ? "先在上面连上眼镜"
-                     : "建议顺序：先「只发第 1 步」→ 看眼镜提示有没有消失 → 没有的话再「发全部」。")
+                     : "顺序：投递自检（看屏幕亮度）→ 只发第 1 步 → 还不消失就发全部 21 步。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

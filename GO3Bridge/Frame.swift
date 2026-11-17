@@ -16,6 +16,16 @@ enum GO3FrameError: Error {
     case crcMismatch
 }
 
+/// 地址约定，来自 sniff.log 的实测：
+/// 手机 → 眼镜 的 95 条发送帧**全部**是 `type=0x00 src=3 dst=1`；
+/// 眼镜 → 手机 的 1537 条接收帧是 `src=1或2 dst=3`。
+/// 早前把「接收方向」的帧原样发回眼镜，等于把对方的话念回给它听，眼镜当然没反应。
+enum GO3Peer {
+    static let typePhone: UInt8 = 0x00
+    static let srcPhone: UInt8 = 3
+    static let dstGlasses: UInt8 = 1
+}
+
 struct GO3Frame {
     let type: UInt8
     let seq: UInt8
@@ -44,12 +54,14 @@ struct GO3Frame {
                         payload: payload, crcOK: crcRecv == crcCalc)
     }
 
-    /// 构造一帧。payload 上限 65535，长度字段按 2 字节大端写。
-    static func build(type: UInt8, seq: UInt8, src: UInt8, dst: UInt8,
-                      payload: [UInt8]) -> Data {
-        var body: [UInt8] = [0xAA, 0x55, type, seq,
-                             0x00, 0x01, 0x00, 0x00,
-                             src, dst,
+    /// 造一个包。包头布局全部来自官方 App 真实发出的字节（sniff.log 里 95 条发送帧），
+    /// 不是推的：`[2]=0x00`、`[4..5]=总包数`、`[6..7]=当前包号`、`[8]=3(手机)`、`[9]=1(眼镜)`。
+    static func buildPacket(seq: UInt8, total: Int, index: Int, payload: [UInt8]) -> Data {
+        var body: [UInt8] = [0xAA, 0x55,
+                             GO3Peer.typePhone, seq,
+                             UInt8((total >> 8) & 0xFF), UInt8(total & 0xFF),
+                             UInt8((index >> 8) & 0xFF), UInt8(index & 0xFF),
+                             GO3Peer.srcPhone, GO3Peer.dstGlasses,
                              UInt8((payload.count >> 8) & 0xFF),
                              UInt8(payload.count & 0xFF)]
         body.append(contentsOf: payload)
@@ -57,6 +69,54 @@ struct GO3Frame {
         body.append(UInt8(crc >> 8))
         body.append(UInt8(crc & 0xFF))
         return Data(body)
+    }
+
+    /// 一条消息按单包上限切成多个包。官方 App 就是这么发的：
+    /// 每包总长 ≤244B（Android MTU 247 − 3），超出就 total=N、index=k、seq 不变。
+    static func packets(seq: UInt8, payload: [UInt8], maxPayload: Int) -> [Data] {
+        let size = max(16, maxPayload)
+        let total = max(1, (payload.count + size - 1) / size)
+        if total == 1 {
+            return [buildPacket(seq: seq, total: 1, index: 0, payload: payload)]
+        }
+        var out: [Data] = []
+        for i in 0 ..< total {
+            let lo = i * size
+            let hi = min(lo + size, payload.count)
+            out.append(buildPacket(seq: seq, total: total, index: i,
+                                   payload: Array(payload[lo ..< hi])))
+        }
+        return out
+    }
+
+    /// 从记录下来的帧里只取 payload。
+    /// 注意：`INTEL/app_init_wire.json` 里的 `frame` 字段是早前按「接收方向」模板合成的，
+    /// 包头（type/src/dst）是错的，只有 payload 是官方 protobuf 的真实内容。
+    /// stripVersion：官方发出的 protobuf 文本里没有 `version:` 字段，而收到的都有
+    /// `version: 1`，说明手机发的时候不带这 2 个字节。
+    static func payloadFromRecorded(_ hex: String, stripVersion: Bool) -> [UInt8]? {
+        guard let data = dataFromHex(hex) else { return nil }
+        let b = [UInt8](data)
+        guard b.count >= 14 else { return nil }
+        let len = (Int(b[10]) << 8) | Int(b[11])
+        guard len > 0, b.count >= 12 + len + 2 else { return nil }
+        var p = Array(b[12 ..< (12 + len)])
+        if stripVersion, p.count >= 2, p[0] == 0x08, p[1] == 0x01 {
+            p.removeFirst(2)
+        }
+        return p
+    }
+
+    /// 构造器自检：拿官方真实捕获的「亮度 30」帧逐字节比对。
+    /// 这条帧是从 sniff.log 的「传输数据：」里原样抄的，CRC 已验证通过。
+    static func builderSelfTest() -> String {
+        let golden = "aa5500b2000100000301000c100b720808011a040801280628fe"
+        let payload: [UInt8] = [0x10, 0x0b, 0x72, 0x08, 0x08, 0x01,
+                                0x1a, 0x04, 0x08, 0x01, 0x28, 0x06]
+        let built = buildPacket(seq: 178, total: 1, index: 0, payload: payload)
+        let mine = built.map { String(format: "%02x", $0) }.joined()
+        if mine == golden { return "一致" }
+        return "不一致！我方=\(mine) 官方=\(golden)"
     }
 
     /// 十六进制字符串 → 字节。初始化序列里存的是原样帧，直接还原即可。

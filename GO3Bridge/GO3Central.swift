@@ -47,6 +47,16 @@ final class GO3Central: NSObject, ObservableObject {
     @Published var useRW2021 = true
     @Published private(set) var initRunning = false
 
+    /// 手机发给眼镜的消息带不带 `08 01`（Message.version=1）这 2 个字节。
+    /// 默认不带：官方发出了 95 条帧，protobuf 文本里没有一条有 `version:` 字段，
+    /// 而眼镜发来的帧全部有 `version: 1`。真不生效再打开这个开关兜底。
+    @Published var keepVersionPrefix = false
+
+    /// 用"带回执"(write) 还是"无回执"(writeNR)。默认无回执——官方是流式发包。
+    /// 但如果眼镜对 2021 上的无回执写直接不理，就得靠这个开关把两种情况分开，
+    /// 否则永远分不清是信封错还是写方式错。
+    @Published var useWriteResponse = false
+
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
@@ -148,30 +158,53 @@ final class GO3Central: NSObject, ObservableObject {
 
     private func maxWriteLength(_ ch: CBCharacteristic) -> Int {
         guard let p = connectedPeripheral else { return 20 }
-        let nr = ch.properties.contains(.writeWithoutResponse)
+        let nr = !useWriteResponse && ch.properties.contains(.writeWithoutResponse)
         return max(20, p.maximumWriteValueLength(for: nr ? .withoutResponse : .withResponse))
     }
 
+    /// 排队一次写。分包已经在 `sendPayload` 里按协议做完了，这里不再切字节——
+    /// 把一条逻辑帧随便切片会破坏它自己的长度字段和 CRC。
     private func enqueue(_ data: Data, ch: CBCharacteristic, label: String) {
-        let limit = maxWriteLength(ch)
-        guard data.count > limit else {
-            queue.append(PendingWrite(data: data, ch: ch, label: label))
-            pump()
+        queue.append(PendingWrite(data: data, ch: ch, label: label))
+        pump()
+    }
+
+    /// 帧号。官方 App 每条逻辑消息一个帧号，多个分包共用同一个。
+    private var seqCounter: UInt8 = 1
+
+    private func nextSeq() -> UInt8 {
+        let s = seqCounter
+        seqCounter = seqCounter &+ 1
+        if seqCounter == 0 { seqCounter = 1 }
+        return s
+    }
+
+    /// 把一条 protobuf 消息发出去：按 MTU 算单包 payload 上限，切成 1..N 个包。
+    private func sendPayload(_ payload: [UInt8], ch: CBCharacteristic, label: String) {
+        let perPacket = max(16, maxWriteLength(ch) - 14)   // 14 = 12B 包头 + 2B CRC
+        let seq = nextSeq()
+        let parts = GO3Frame.packets(seq: seq, payload: payload, maxPayload: perPacket)
+        for (i, pkt) in parts.enumerated() {
+            let tag = parts.count > 1 ? "\(label) 包\(i + 1)/\(parts.count)" : label
+            enqueue(pkt, ch: ch, label: "\(tag) seq=\(seq) \(payload.count)B")
+        }
+    }
+
+    /// 投递自检：发官方的「亮度 30」命令。
+    /// 为什么挑它：效果立刻可见、无害可逆，而且这条帧是从真实抓包里原样抄的，
+    /// 不依赖我们对绑定语义的任何猜测。屏幕一变，就说明通道和信封都对了。
+    func sendBrightnessTest() {
+        guard let ch = targetChannel else {
+            append("还没连上眼镜，先连接")
             return
         }
-        let parts = (data.count + limit - 1) / limit
-        append("    这条 \(data.count)B 超过单次写入上限 \(limit)B，拆成 \(parts) 段")
-        var off = 0
-        var part = 1
-        while off < data.count {
-            let end = min(off + limit, data.count)
-            queue.append(PendingWrite(data: data.subdata(in: off ..< end),
-                                      ch: ch,
-                                      label: "\(label) [\(part)/\(parts)]"))
-            off = end
-            part += 1
-        }
-        pump()
+        append("投递自检：把亮度设成 30（官方原帧，payload 未改一个字节）")
+        sendPayload([0x10, 0x0B, 0x72, 0x08, 0x08, 0x01, 0x1A, 0x04, 0x08, 0x01, 0x28, 0x06],
+                    ch: ch, label: "CONTROL_COMMAND 亮度30")
+    }
+
+    private var targetChannel: CBCharacteristic? {
+        useRW2021 ? rwChar2021 : writeChar1001
     }
 
     /// 一次只发一段。无响应写没有回调，靠 20ms 让出主线程再发下一段；
@@ -182,7 +215,7 @@ final class GO3Central: NSObject, ObservableObject {
               !queue.isEmpty else { return }
 
         let item = queue[0]
-        let nr = item.ch.properties.contains(.writeWithoutResponse)
+        let nr = !useWriteResponse && item.ch.properties.contains(.writeWithoutResponse)
         // 无响应写有流控：上一段还没被控制器吐出去就硬塞会被静默丢弃。
         if nr && !p.canSendWriteWithoutResponse { return }
 
@@ -225,6 +258,7 @@ final class GO3Central: NSObject, ObservableObject {
 
         let list = firstOnly ? Array(InitSequence.steps.prefix(1)) : InitSequence.steps
         append("开始发送初始化：\(list.count) 步，通道 \(short(ch.uuid))，单次写入上限 \(maxWriteLength(ch))B")
+        append("  信封：type=0x00 src=3 dst=1，\(keepVersionPrefix ? "带" : "不带") 08 01 版本前缀")
         if !firstOnly {
             append("已跳过第 \(InitSequence.skippedIdx) 步（原始数据标了含猜测字段）")
         }
@@ -272,8 +306,9 @@ final class GO3Central: NSObject, ObservableObject {
         }
 
         let s = list[i]
-        if let data = GO3Frame.dataFromHex(s.hex) {
-            enqueue(data, ch: ch, label: "init#\(s.idx) \(s.name)")
+        let cleanName = s.name.replacingOccurrences(of: " {", with: "")
+        if let payload = GO3Frame.payloadFromRecorded(s.hex, stripVersion: !keepVersionPrefix) {
+            sendPayload(payload, ch: ch, label: "init#\(s.idx) \(cleanName)")
         } else {
             append("init#\(s.idx) 的 hex 解析失败，跳过")
         }
@@ -357,6 +392,9 @@ extension GO3Central: CBCentralManagerDelegate {
         connectedPeripheral = peripheral
         connectedName = peripheral.name ?? peripheral.identifier.uuidString
         append("已连接 \(connectedName ?? "")，开始枚举服务")
+        // 把包构造器和官方真实捕获的那条帧逐字节比一次。
+        // 这行如果显示"不一致"，后面发什么都白费，先修构造器。
+        append("包构造器自检：\(GO3Frame.builderSelfTest())")
         peripheral.delegate = self
         peripheral.discoverServices(nil)
     }
@@ -379,6 +417,7 @@ extension GO3Central: CBCentralManagerDelegate {
         initRunning = false
         queue.removeAll()
         writing = false
+        seqCounter = 1
     }
 }
 
