@@ -340,7 +340,11 @@ final class GO3Central: NSObject, ObservableObject {
     }
 
     /// 手动发绑定。kind: 2 = 首次绑定（BIND_USERDATA），1 = 回连（BACK_LINK）。
-    func sendBind(kind: UInt8) {
+    ///
+    /// `autoFallback` 默认 true：眼镜重启后绑定状态其实还在，这时官方会发 BACK_LINK(1)，
+    /// 而我们固定发 BIND_USERDATA(2) 可能被冷处理。所以发完等不到 `isBound=1`
+    /// 就自动补一发 kind=1，最多来回一次，避免死循环。
+    func sendBind(kind: UInt8, autoFallback: Bool = true) {
         guard let ch = targetChannel else {
             append("还没连上眼镜，先连接")
             return
@@ -349,12 +353,21 @@ final class GO3Central: NSObject, ObservableObject {
         append("→ 发绑定：\(name)，userAccount=\"\(userAccount)\"")
         sendPayload(bindPayload(kind: kind), ch: ch, label: "BLE_CONNECT_BIND \(name)")
         stage = .waitingBind
+        bindTries += 1
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
             guard let self = self, self.stage == .waitingBind else { return }
             self.stage = .idle
+            if autoFallback, self.bindTries < 2 {
+                self.append("6 秒内没等到绑定响应。改发一条「回连」试试（眼镜保留着上次的绑定）")
+                self.sendBind(kind: kind == 2 ? 1 : 2, autoFallback: false)
+                return
+            }
             self.append("6 秒内没等到绑定响应。眼镜可能直接忽略了这条绑定。")
         }
     }
+
+    /// 一次连接内最多试几次绑定，防止两种 kind 互相触发无限循环。
+    private var bindTries = 0
 
     // MARK: - 上报 App 版本（「APP 版本过低」的唯一解药）
 
@@ -424,6 +437,7 @@ final class GO3Central: NSObject, ObservableObject {
         switch rep.msgType {
         case 3: // BIND_STATUS_RESPONSE
             if rep.isBound {
+                bindTries = 0
                 append("  → 绑定成功。")
                 guard stage == .waitingBind else {
                     stage = .idle
@@ -452,6 +466,12 @@ final class GO3Central: NSObject, ObservableObject {
                 append("  → 先别发初始化。官方在未绑定状态下会直接断开，硬发只会把连接搞崩。")
                 if stage == .waitingBind { stage = .idle }
                 testAfterInit = false
+                // errorCode=3 常见于「眼镜还留着旧绑定、等的是回连」这种情形，
+                // 换一种 kind 再试一次，别让用户来回点。
+                if bindTries < 2, rep.errorCode == 3 {
+                    append("  → 改发一条「回连」再试一次")
+                    sendBind(kind: 1, autoFallback: false)
+                }
             }
         case 6: // UNBIND
             append("  → 眼镜发来 UNBIND（解绑/未授权），需要重新绑定。")
@@ -665,6 +685,7 @@ extension GO3Central: CBCentralManagerDelegate {
         connectedPeripheral = peripheral
         connectedName = peripheral.name ?? peripheral.identifier.uuidString
         experimentHintShown = false
+        bindTries = 0
         append("已连接 \(connectedName ?? "")，开始枚举服务")
         // 把包构造器和官方真实捕获的那条帧逐字节比一次。
         // 这行如果显示"不一致"，后面发什么都白费，先修构造器。
@@ -694,6 +715,7 @@ extension GO3Central: CBCentralManagerDelegate {
         seqCounter = 1
         testAfterInit = false
         stage = .idle
+        bindTries = 0
         releaseWork?.cancel()
         releaseWork = nil
         append("  连接已断。如果不是你手动断的，重点看断之前最后几帧眼镜发了什么。")
