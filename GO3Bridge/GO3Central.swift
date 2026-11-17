@@ -57,6 +57,13 @@ final class GO3Central: NSObject, ObservableObject {
     /// 否则永远分不清是信封错还是写方式错。
     @Published var useWriteResponse = false
 
+    /// 绑定成功后要不要继续跑那 21 步初始化。
+    /// **默认关**。理由：那 21 步是官方「已经绑定好、走 SPP 通道」时的会话初始化，
+    /// 里面混着 SPEECH_INSCRIPTION（切显示页面）这类副作用，很可能把眼镜切到提词器界面、
+    /// 反而让后面的 CONTROL_COMMAND 被忽略。
+    /// 先用「绑定 → 直接发命令」这个最小组合验证 BLE 通道到底能不能带业务命令。
+    @Published var runInitAfterBind = false
+
     /// 收到的帧数。这是判断"眼镜到底有没有在跟我们说话"最直接的指标：
     /// 长按 GO 键说了话之后如果这个数不涨，就是它根本没把 ASR 发出来，
     /// 而不是我们没解析。
@@ -204,17 +211,36 @@ final class GO3Central: NSObject, ObservableObject {
         }
     }
 
-    /// 投递自检：发官方的「亮度 30」命令。
-    /// 为什么挑它：效果立刻可见、无害可逆，而且这条帧是从真实抓包里原样抄的，
-    /// 不依赖我们对绑定语义的任何猜测。屏幕一变，就说明通道和信封都对了。
+    /// 投递自检：发官方的「亮度」命令。
+    /// 为什么挑它：效果立刻可见、无害可逆，而且这条帧结构是从真实抓包里扒出来的：
+    ///   `command{ brightness{ brightness:30 } type:BRIGHTNESS_CTRL }`
+    ///   payload = 10 0b | 72 08 | 08 01 | 1a 04 | 08 01 | 28 06
+    /// 其中 `28 <level>` 就是亮度值，实测 30% 对应 6，所以是 0~10 档。
+    /// 上一版固定发 30（level 6）有个坑：眼镜本来就接近这个亮度时，看不出来。
     func sendBrightnessTest() {
+        sendBrightness(level: 1)
+    }
+
+    func sendBrightness(level: Int) {
         guard let ch = targetChannel else {
             append("还没连上眼镜，先连接")
             return
         }
-        append("投递自检：把亮度设成 30（官方原帧，payload 未改一个字节）")
-        sendPayload([0x10, 0x0B, 0x72, 0x08, 0x08, 0x01, 0x1A, 0x04, 0x08, 0x01, 0x28, 0x06],
-                    ch: ch, label: "CONTROL_COMMAND 亮度30")
+        let lv = UInt8(max(0, min(10, level)))
+        append("→ 亮度设为 \(lv) 档（约 \(lv * 5)%）")
+        sendPayload([0x10, 0x0B, 0x72, 0x08, 0x08, 0x01, 0x1A, 0x04, 0x08, 0x01, 0x28, lv],
+                    ch: ch, label: "CONTROL_COMMAND 亮度\(lv)")
+        observeAfterCommand()
+    }
+
+    /// 发完命令后看眼镜有没有动静。这是判断"写到底有没有被消费"最直接的办法：
+    /// 如果 3 秒内收到帧数一点没涨，很可能是命令被丢在 BLE 通道上没人处理。
+    private func observeAfterCommand() {
+        let before = rxCount
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self = self else { return }
+            self.append("  ▸ 命令发出后 3 秒：新收到 \(self.rxCount - before) 帧")
+        }
     }
 
     private var targetChannel: CBCharacteristic? {
@@ -298,13 +324,26 @@ final class GO3Central: NSObject, ObservableObject {
         switch rep.msgType {
         case 3: // BIND_STATUS_RESPONSE
             if rep.isBound {
-                append("  → 绑定成功。按官方时序等 5 秒再发初始化。")
-                guard stage == .waitingBind else { return }
+                append("  → 绑定成功。")
+                guard stage == .waitingBind else {
+                    stage = .idle
+                    return
+                }
                 stage = .waitingInit
-                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                    guard let self = self, self.stage == .waitingInit else { return }
-                    self.append("  → 5 秒到，开始发初始化")
-                    self.sendInit(firstOnly: false)
+                if runInitAfterBind {
+                    append("  → 按官方时序等 5 秒再发 21 步初始化")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                        guard let self = self, self.stage == .waitingInit else { return }
+                        self.append("  → 5 秒到，开始发初始化")
+                        self.sendInit(firstOnly: false)
+                    }
+                } else {
+                    append("  → 跳过 21 步初始化（开关关着），2 秒后直接发亮度命令")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                        guard let self = self, self.stage == .waitingInit else { return }
+                        self.stage = .idle
+                        self.sendBrightness(level: 1)
+                    }
                 }
             } else {
                 append("  → 绑定未通过：\(rep.hint)")

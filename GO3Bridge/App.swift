@@ -207,26 +207,46 @@ struct RootView: View {
             Text("初始化握手")
                 .font(.headline)
 
-            Text("「一键流程」按官方时序走：首次绑定 → 等绑定响应 → isBound=1 后等 5 秒 → 发 21 步 → 2 秒后亮度自检。绑定不过就停，不硬推。")
+            Text("「一键流程」= 首次绑定 → 等绑定响应 → isBound=1 → 2 秒后发亮度（默认跳过 21 步）。绑定不过就停，不硬推。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
             Button {
                 ble.runOfficialFlow()
             } label: {
-                Text("一键：绑定 → 初始化 → 亮度自检")
+                Text("一键：绑定 → 亮度自检")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .disabled(!canSendInit)
 
-            Button {
-                ble.sendBrightnessTest()
-            } label: {
-                Text("只发自检：把亮度设成 30")
+            Toggle(isOn: $ble.runInitAfterBind) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ble.runInitAfterBind ? "绑定后再跑 21 步初始化" : "绑定后直接发命令（默认）")
+                        .font(.subheadline)
+                    Text("那 21 步是官方走 SPP 时的会话初始化，里面混着切页面指令，可能把命令吃掉")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(ble.initRunning)
+
+            Text("单独发亮度（0~10 档，档位差得越大越容易看出）")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Button("最暗 1") { ble.sendBrightness(level: 1) }
+                    .buttonStyle(.bordered)
+                    .frame(maxWidth: .infinity)
+                Button("中 5") { ble.sendBrightness(level: 5) }
+                    .buttonStyle(.bordered)
+                    .frame(maxWidth: .infinity)
+                Button("最亮 10") { ble.sendBrightness(level: 10) }
+                    .buttonStyle(.bordered)
                     .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.bordered)
+            .font(.subheadline)
             .disabled(!canSendInit)
 
             Divider()
