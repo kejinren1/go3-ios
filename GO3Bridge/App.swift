@@ -20,6 +20,7 @@ struct RootView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     statusCard
                     deviceSection
+                    initSection
                     logSection
                 }
                 .padding()
@@ -129,8 +130,79 @@ struct RootView: View {
         }
     }
 
-    // MARK: - 日志
+    // MARK: - 初始化握手
 
+    /// P3 的核心区。
+    /// 眼镜现在会响"连接成功"的音效，但屏幕上一直提示「下载 INMO App」——
+    /// 因为 BLE 只是连上了，App 一个字节都没回过，眼镜不认这个对端。
+    /// 这里就把官方 App 开机时发的那串初始化帧补上。
+    private var initSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("初始化握手")
+                .font(.headline)
+
+            Text("眼镜连上后仍在提示「下载 INMO App」，是因为它没收到 App 的初始化序列。动作按钮会把官方 App 开机时发的帧重放一遍。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            Toggle(isOn: $ble.useRW2021) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ble.useRW2021 ? "写通道：2021" : "写通道：1001")
+                        .font(.subheadline)
+                    Text(ble.useRW2021 ? "read+write+writeNR，与通知 2022 同服务" : "7033 服务下的 writeNR")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(ble.initRunning)
+
+            HStack(spacing: 10) {
+                Button {
+                    ble.sendInit(firstOnly: true)
+                } label: {
+                    Text("只发第 1 步")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSendInit)
+
+                Button {
+                    ble.sendInit(firstOnly: false)
+                } label: {
+                    Text("发全部 \(InitSequence.steps.count) 步")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canSendInit)
+            }
+            .font(.subheadline)
+
+            if ble.initRunning {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                    Text("发送中…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text(ble.connectedName == nil
+                     ? "先在上面连上眼镜"
+                     : "建议顺序：先「只发第 1 步」→ 看眼镜提示有没有消失 → 没有的话再「发全部」。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var canSendInit: Bool {
+        ble.connectedName != nil && !ble.initRunning
+    }
+
+    // MARK: - 日志
     private var logSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {

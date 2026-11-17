@@ -37,6 +37,16 @@ final class GO3Central: NSObject, ObservableObject {
     private var central: CBCentralManager!
     private var found: [UUID: CBPeripheral] = [:]
 
+    /// 发送初始化帧要用到的三条特征。连上后才会被填。
+    private var connectedPeripheral: CBPeripheral?
+    private var writeChar1001: CBCharacteristic?
+    private var rwChar2021: CBCharacteristic?
+
+    /// 写哪条通道。默认 2021（read+write+writeNR，和通知 2022 同属一个服务），
+    /// 但抓包里没记官方 App 用的是哪条，所以做成可切换，靠实测定。
+    @Published var useRW2021 = true
+    @Published private(set) var initRunning = false
+
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
@@ -121,6 +131,157 @@ final class GO3Central: NSObject, ObservableObject {
         append("已把 \(log.count) 行日志复制到剪贴板")
     }
 
+    // MARK: - 发送初始化（P3 核心）
+
+    /// 一帧可能要拆成多段写：BLE 单次写入受 MTU 限制（iOS 上 writeNR 通常 182B，
+    /// withResponse 可能到 512B），而官方初始化序列里最长的一条是 283 字节。
+    /// 官方 App 当年必然也是分段发出去的，所以这里照样逐段发。
+    private struct PendingWrite {
+        let data: Data
+        let ch: CBCharacteristic
+        let label: String
+    }
+
+    private var queue: [PendingWrite] = []
+    /// withResponse 的写正在等回执，此时不能再发下一段。
+    private var writing = false
+
+    private func maxWriteLength(_ ch: CBCharacteristic) -> Int {
+        guard let p = connectedPeripheral else { return 20 }
+        let nr = ch.properties.contains(.writeWithoutResponse)
+        return max(20, p.maximumWriteValueLength(for: nr ? .withoutResponse : .withResponse))
+    }
+
+    private func enqueue(_ data: Data, ch: CBCharacteristic, label: String) {
+        let limit = maxWriteLength(ch)
+        guard data.count > limit else {
+            queue.append(PendingWrite(data: data, ch: ch, label: label))
+            pump()
+            return
+        }
+        let parts = (data.count + limit - 1) / limit
+        append("    这条 \(data.count)B 超过单次写入上限 \(limit)B，拆成 \(parts) 段")
+        var off = 0
+        var part = 1
+        while off < data.count {
+            let end = min(off + limit, data.count)
+            queue.append(PendingWrite(data: data.subdata(in: off ..< end),
+                                      ch: ch,
+                                      label: "\(label) [\(part)/\(parts)]"))
+            off = end
+            part += 1
+        }
+        pump()
+    }
+
+    /// 一次只发一段。无响应写没有回调，靠 20ms 让出主线程再发下一段；
+    /// 有响应写则等 didWriteValueFor 把 writing 放开。
+    private func pump() {
+        guard !writing,
+              let p = connectedPeripheral, p.state == .connected,
+              !queue.isEmpty else { return }
+
+        let item = queue[0]
+        let nr = item.ch.properties.contains(.writeWithoutResponse)
+        // 无响应写有流控：上一段还没被控制器吐出去就硬塞会被静默丢弃。
+        if nr && !p.canSendWriteWithoutResponse { return }
+
+        queue.removeFirst()
+        p.writeValue(item.data, for: item.ch, type: nr ? .withoutResponse : .withResponse)
+        append("→ \(short(item.ch.uuid))  \(item.data.count)B  \(item.label)")
+        if item.data.count <= 64 {
+            append("       \(hex(item.data))")
+        } else {
+            append("       \(hex(item.data.prefix(10)))…（共 \(item.data.count)B）")
+        }
+
+        if nr {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                self?.pump()
+            }
+        } else {
+            writing = true
+        }
+    }
+
+    /// firstOnly = true 时只发第 1 步（BLE_CONNECT_BIND）。
+    /// 为什么要有这个开关：绑定帧里带 user_account，是最可能让眼镜"认下"
+    /// 这个 App 的一步；先只发它，能干净地判断「是不是就缺这一下」，
+    /// 而不是一口气推 21 帧、出了问题分不清是哪一步的锅。
+    func sendInit(firstOnly: Bool) {
+        guard let p = connectedPeripheral, p.state == .connected else {
+            append("还没连上眼镜，先连接再发")
+            return
+        }
+        let target = useRW2021 ? rwChar2021 : writeChar1001
+        guard let ch = target else {
+            append(useRW2021 ? "没找到 2021 特征" : "没找到 1001 特征")
+            return
+        }
+        guard !initRunning else {
+            append("上一轮还没发完")
+            return
+        }
+
+        let list = firstOnly ? Array(InitSequence.steps.prefix(1)) : InitSequence.steps
+        append("开始发送初始化：\(list.count) 步，通道 \(short(ch.uuid))，单次写入上限 \(maxWriteLength(ch))B")
+        if !firstOnly {
+            append("已跳过第 \(InitSequence.skippedIdx) 步（原始数据标了含猜测字段）")
+        }
+        initRunning = true
+        sendStep(list, 0, ch, 0)
+    }
+
+    /// `wait` 是"这一帧因为流控被挡住"的重试计数，防止死等。
+    private func sendStep(_ list: [InitStep], _ i: Int, _ ch: CBCharacteristic, _ wait: Int) {
+        // 中途断连就把循环停掉，否则会在断连后继续空转、最后还误报"发送完毕"。
+        guard let p = connectedPeripheral, p.state == .connected else {
+            initRunning = false
+            queue.removeAll()
+            writing = false
+            append("连接已断，初始化中止（已排到第 \(i)/\(list.count) 步）")
+            return
+        }
+        guard i < list.count else {
+            // 队列还没吐完就再等一会儿，别提前报完成。
+            // wait 在这里被复用作"等待轮数"，上限 150×200ms=30s，超时就认账收工，
+            // 免得某一个回执丢了就把界面卡在"发送中"永远不退。
+            guard queue.isEmpty && !writing else {
+                if wait >= 150 {
+                    initRunning = false
+                    writing = false
+                    append("还有 \(queue.count) 段没发出去，超时收工（可能是写回执丢了）")
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    self?.sendStep(list, i, ch, wait + 1)
+                }
+                return
+            }
+            initRunning = false
+            append("初始化发送完毕（\(list.count) 步）。看看眼镜还提不提示「下载 INMO App」")
+            return
+        }
+
+        if !p.canSendWriteWithoutResponse, wait < 60,
+           ch.properties.contains(.writeWithoutResponse) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.sendStep(list, i, ch, wait + 1)
+            }
+            return
+        }
+
+        let s = list[i]
+        if let data = GO3Frame.dataFromHex(s.hex) {
+            enqueue(data, ch: ch, label: "init#\(s.idx) \(s.name)")
+        } else {
+            append("init#\(s.idx) 的 hex 解析失败，跳过")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.sendStep(list, i + 1, ch, 0)
+        }
+    }
+
     func connect(_ d: BleDevice) {
         guard let p = found[d.id] else {
             append("拿不到外设对象，重新扫一次")
@@ -193,6 +354,7 @@ extension GO3Central: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        connectedPeripheral = peripheral
         connectedName = peripheral.name ?? peripheral.identifier.uuidString
         append("已连接 \(connectedName ?? "")，开始枚举服务")
         peripheral.delegate = self
@@ -211,6 +373,12 @@ extension GO3Central: CBCentralManagerDelegate {
                         error: Error?) {
         append("连接断开：\(error?.localizedDescription ?? "对端主动断开")")
         connectedName = nil
+        connectedPeripheral = nil
+        writeChar1001 = nil
+        rwChar2021 = nil
+        initRunning = false
+        queue.removeAll()
+        writing = false
     }
 }
 
@@ -240,6 +408,16 @@ extension GO3Central: CBPeripheralDelegate {
         }
         for c in service.characteristics ?? [] {
             append("    特征 \(short(c.uuid))  [\(props(c.properties))]")
+
+            if c.uuid == GO3UUID.write1001 { writeChar1001 = c }
+            if c.uuid == GO3UUID.rw2021 {
+                rwChar2021 = c
+                // 这个数字直接决定 283 字节的长帧要不要拆段，先打出来,
+                // 免得后面靠猜。
+                let nr = peripheral.maximumWriteValueLength(for: .withoutResponse)
+                let wr = peripheral.maximumWriteValueLength(for: .withResponse)
+                append("      单次写入上限：writeNR \(nr)B / write \(wr)B")
+            }
 
             // 订阅通知：只读，不会改变眼镜状态。安卓那边靠这条拿 60 秒心跳。
             if c.properties.contains(.notify) || c.properties.contains(.indicate) {
@@ -282,7 +460,24 @@ extension GO3Central: CBPeripheralDelegate {
                     didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
         if let error = error {
-            append("  订阅失败 \(characteristic.uuid.uuidString)：\(error.localizedDescription)")
+            append("  订阅失败 \(short(characteristic.uuid))：\(error.localizedDescription)")
         }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral,
+                    didWriteValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        // 只报错，成功不刷屏 —— 21 步初始化会打出 21 行噪音，反而把异常淹了。
+        if let error = error {
+            append("  写入失败 \(short(characteristic.uuid))：\(error.localizedDescription)")
+        }
+        // 有响应写走的是"发一段等一段"，回执到了才放下一段。
+        writing = false
+        pump()
+    }
+
+    /// 无响应写被流控挡住时，系统在这里告诉我们"可以继续了"。
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        pump()
     }
 }

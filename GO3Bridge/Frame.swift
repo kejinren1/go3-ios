@@ -2,11 +2,13 @@ import Foundation
 
 /// GO3 的帧格式，与 go3-bridge/proto/send.py 的 build_frame() 逐字节对应：
 ///
-///     AA 55 | type | seq | 00 01 | 00 00 | src | dst | 00 | len | payload | crc16(2B, 大端)
-///      0  1     2      3     4  5     6  7     8     9    10   11     12..     末尾2B
+///     AA 55 | type | seq | 00 01 | 00 00 | src | dst | len(2B 大端) | payload | crc16(2B 大端)
+///      0  1     2      3     4  5     6  7     8     9     10  11        12..      末尾2B
 ///
-/// 这个布局不是猜的：安卓侧用 bleak 实测收发验证过，记录在
-/// go3-bridge/proto/PROTOCOL.md 与 recon/out/4E048CFE585E_notify.log。
+/// **长度字段是 2 字节大端（偏移 10..11），不是 1 字节** —— 这条 2026-11-18 才纠正。
+/// 短帧的高位恰好是 00，所以按单字节读也一直"能用"；直到拿官方初始化序列里
+/// 两条 283 字节的 SAGENOTE 语言表帧做 CRC 校验才露馅（283−14=269=0x010D）。
+/// 改成 `(b[10]<<8)|b[11]` 后：初始化序列 21/21、历史通知日志 27/27 全过。
 enum GO3FrameError: Error {
     case notOurFrame
     case tooShort
@@ -31,7 +33,7 @@ struct GO3Frame {
         guard b.count >= headerLength + crcLength else { return nil }
         guard b[0] == 0xAA, b[1] == 0x55 else { return nil }
 
-        let len = Int(b[11])
+        let len = (Int(b[10]) << 8) | Int(b[11])
         guard b.count >= headerLength + len + crcLength else { return nil }
 
         let payload = Array(b[headerLength ..< (headerLength + len)])
@@ -42,17 +44,34 @@ struct GO3Frame {
                         payload: payload, crcOK: crcRecv == crcCalc)
     }
 
-    /// 构造一帧（P2 之后发命令用）。P1 阶段不调用，先摆在这里保证两边算法一致。
+    /// 构造一帧。payload 上限 65535，长度字段按 2 字节大端写。
     static func build(type: UInt8, seq: UInt8, src: UInt8, dst: UInt8,
                       payload: [UInt8]) -> Data {
         var body: [UInt8] = [0xAA, 0x55, type, seq,
                              0x00, 0x01, 0x00, 0x00,
-                             src, dst, 0x00, UInt8(payload.count & 0xFF)]
+                             src, dst,
+                             UInt8((payload.count >> 8) & 0xFF),
+                             UInt8(payload.count & 0xFF)]
         body.append(contentsOf: payload)
         let crc = CRC16.ccittFalse(body)
         body.append(UInt8(crc >> 8))
         body.append(UInt8(crc & 0xFF))
         return Data(body)
+    }
+
+    /// 十六进制字符串 → 字节。初始化序列里存的是原样帧，直接还原即可。
+    static func dataFromHex(_ s: String) -> Data? {
+        let clean = s.replacingOccurrences(of: " ", with: "")
+        guard clean.count % 2 == 0 else { return nil }
+        var bytes: [UInt8] = []
+        var i = clean.startIndex
+        while i < clean.endIndex {
+            guard let next = clean.index(i, offsetBy: 2, limitedBy: clean.endIndex) else { return nil }
+            guard let b = UInt8(clean[i ..< next], radix: 16) else { return nil }
+            bytes.append(b)
+            i = next
+        }
+        return Data(bytes)
     }
 
     /// 给日志看的一行摘要。
