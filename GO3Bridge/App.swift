@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import CoreBluetooth
 
 @main
 struct GO3BridgeApp: App {
@@ -10,54 +11,144 @@ struct GO3BridgeApp: App {
     }
 }
 
-/// P0 阶段只做一件事：证明这个 App 能被编译出来、签名、装到手机上、能启动。
-/// 所以这里刻意只显示环境信息，不碰蓝牙 —— 出问题时可以立刻判断是
-/// 安装链路坏了，还是后面的蓝牙代码坏了。
 struct RootView: View {
-    private let rows: [(String, String, Bool)] = [
-        ("安装链路", "已跑通", true),
-        ("蓝牙连接", "未接入", false),
-        ("协议收发", "未接入", false),
-        ("语音上屏", "未接入", false),
-    ]
+    @StateObject private var ble = GO3Central()
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    ForEach(rows, id: \.0) { row in
-                        HStack {
-                            Text(row.0)
-                            Spacer()
-                            Text(row.1)
-                                .foregroundStyle(row.2 ? Color.green : Color.secondary)
-                        }
-                    }
-                } header: {
-                    Text("阶段进度")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    statusCard
+                    deviceSection
+                    logSection
                 }
-
-                Section {
-                    LabeledContent("App 版本", value: appVersion)
-                    LabeledContent("系统版本", value: UIDevice.current.systemVersion)
-                    LabeledContent("机型", value: UIDevice.current.model)
-                } header: {
-                    Text("运行环境")
-                }
-
-                Section {
-                    Text("当前是 P0：只验证「能不能装进 iPhone」。蓝牙与协议在 P1/P2 接进来。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+                .padding()
             }
             .navigationTitle("GO3 Bridge")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(ble.scanning ? "停止" : "扫描") {
+                        if ble.scanning {
+                            ble.stopScan()
+                        } else {
+                            ble.startScan()
+                        }
+                    }
+                    .disabled(!ble.scanning && ble.managerState != .poweredOn)
+                }
+            }
         }
     }
 
-    private var appVersion: String {
-        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
-        return "\(v) (\(b))"
+    // MARK: - 状态
+
+    private var statusCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(color(for: ble.managerState))
+                    .frame(width: 9, height: 9)
+                Text(ble.stateText)
+                    .font(.subheadline)
+                Spacer()
+                if ble.scanning {
+                    Text("扫描中")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let name = ble.connectedName {
+                HStack {
+                    Text("已连接：\(name)")
+                        .font(.subheadline)
+                        .foregroundStyle(.green)
+                    Spacer()
+                    Button("断开") { ble.disconnect() }
+                        .font(.caption)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func color(for s: CBManagerState) -> Color {
+        switch s {
+        case .poweredOn:    return .green
+        case .poweredOff:   return .orange
+        case .unauthorized: return .red
+        case .unsupported:  return .red
+        default:            return .gray
+        }
+    }
+
+    // MARK: - 设备
+
+    private var deviceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("周边设备")
+                .font(.headline)
+
+            if ble.devices.isEmpty {
+                Text("点右上角「扫描」。眼镜要开机，最好先把官方 INMO App 退到后台。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(ble.devices) { d in
+                    Button {
+                        ble.connect(d)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Text(d.isGO3 ? "★" : "•")
+                                .foregroundStyle(d.isGO3 ? Color.green : Color.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(d.name.isEmpty ? "(无名设备)" : d.name)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.primary)
+                                Text(String(d.id.uuidString.prefix(8)))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text("\(d.rssi) dBm")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    Divider()
+                }
+            }
+        }
+    }
+
+    // MARK: - 日志
+
+    private var logSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("日志")
+                    .font(.headline)
+                Spacer()
+                Text("\(ble.log.count) 行")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(ble.log.enumerated()), id: \.offset) { pair in
+                    Text(pair.element)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(10)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
     }
 }
