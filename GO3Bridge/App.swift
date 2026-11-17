@@ -106,7 +106,7 @@ struct RootView: View {
                 .font(.headline)
 
             if ble.devices.isEmpty {
-                Text("点右上角「扫描」。眼镜要开机，最好先把官方 INMO App 退到后台。")
+                Text("点右上角「扫描」。眼镜要开机亮屏；如果手机上装了官方 INMO App，先划掉它，免得抢同一个连接。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
@@ -138,56 +138,54 @@ struct RootView: View {
         }
     }
 
-    // MARK: - 会话让回
+    // MARK: - 连接保持
 
-    /// 这一块是 P8 的核心，也是理解整件事的钥匙。
-    /// 眼镜屏幕上的「会记 / AI 对话 / 翻译 / 演讲提词」不是眼镜自己算的：
-    /// logcat 里 `InmoTranslateAsrClient: asr start Connected,zh` 之后才有
-    /// `翻译模块asr断句内容：{"code":"200",...}` —— 采音在眼镜，识别和大模型在手机 App。
-    /// 我们占着 BLE 连接，官方 App 就上不去，眼镜等于被拔了脑子。
-    /// 所以这里只做一件事：干完活就撒手。
+    /// 上一版这块叫「会话让回」，思路是干完活赶紧断、把连接还给官方 App。
+    /// **23:32 被用户纠正、作废**：绑定是我们这个 App 做的，官方 App 不是这条链路的一环。
+    /// 而且 23:29 的日志证明，那个 12 秒自动断开正是「连接成功几秒后蓝牙断开」的元凶
+    /// （日志 `⏳ 到点，主动断开` 之后紧跟 `连接断开`）。
+    /// 现在默认保持连接，定时断开只当调试开关留着。
     private var sessionSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("会话让回")
+            Text("连接保持")
                 .font(.headline)
 
-            Text("眼镜的会记/翻译/提词靠的是手机 App 调云端，不是眼镜自己算。我们连着不放，官方 App 就起不来，那些功能必然瘫着——你看到的「像没联网一样」就是这个。所以必须用完即断。")
+            Text("绑定由本 App 完成，眼镜只认账号绑定状态。所以必须一直连着——断了眼镜就没法工作。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
             Toggle(isOn: $ble.autoRelease) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(ble.autoRelease ? "干完活自动断开（推荐）" : "一直连着（官方 App 会一直不可用）")
+                    Text(ble.autoRelease ? "定时断开：开（调试用）" : "保持连接（正常状态）")
                         .font(.subheadline)
-                    Text("断得越快，眼镜越快回到能用的状态")
+                    Text(ble.autoRelease
+                         ? "到点会主动断，眼镜屏幕会显示蓝牙断开 —— 这是它在掐连接，别误判成故障"
+                         : "只有你手动按「断开」才会断")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
 
-            HStack(spacing: 8) {
-                Text("停留")
-                    .font(.subheadline)
-                Slider(value: $ble.releaseAfter, in: 5...40, step: 1)
-                Text("\(Int(ble.releaseAfter)) 秒")
-                    .font(.caption)
-                    .monospacedDigit()
-                    .frame(width: 52, alignment: .trailing)
+            if ble.autoRelease {
+                HStack(spacing: 8) {
+                    Text("停留")
+                        .font(.subheadline)
+                    Slider(value: $ble.releaseAfter, in: 5...60, step: 1)
+                    Text("\(Int(ble.releaseAfter)) 秒")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .frame(width: 52, alignment: .trailing)
+                }
             }
-            .disabled(!ble.autoRelease)
 
             Button {
                 ble.releaseNow()
             } label: {
-                Text("立刻把眼镜交回官方 App")
+                Text("断开连接")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .disabled(ble.connectedName == nil)
-
-            Text("连上之后日志里会有一段「单变量实验」，按它三步走一遍，就能确定到底是「占连接」还是「写坏了」。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
         }
         .padding(12)
         .background(Color(.secondarySystemBackground))
@@ -244,6 +242,32 @@ struct RootView: View {
             Text("发送后看日志里的「★ 绑定响应」：isBound=1 才算过。errorCode=1 表示被别的账号占着。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+
+            Divider()
+
+            // 「APP 版本过低无法打开」就是缺这一条。
+            // 眼镜靠 BLE_CONNECT_BIND{kind=7, phoneInfo{f1=版本}} 判断对端 App 的版本，
+            // 官方抓包里发的是 3.0.455。不发或发低了，眼镜菜单里的「会记」直接拒绝打开。
+            Text("上报 App 版本（修「APP 版本过低」）")
+                .font(.subheadline)
+
+            Text("眼镜用这条判断对面是不是够新的正版 App。官方抓包值是 3.0.455。若仍被判过低，往上调再试。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Text("版本")
+                    .font(.subheadline)
+                TextField("3.0.455", text: $ble.phoneVersion)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.subheadline)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                Button("补发版本") { ble.sendPhoneInfo() }
+                    .buttonStyle(.borderedProminent)
+                    .font(.subheadline)
+            }
+            .disabled(ble.connectedName == nil)
         }
         .padding(12)
         .background(Color(.secondarySystemBackground))
@@ -264,14 +288,14 @@ struct RootView: View {
             Text("初始化握手")
                 .font(.headline)
 
-            Text("「一键流程」= 首次绑定 → 等绑定响应 → isBound=1 → 2 秒后发亮度 → 到点自动断开让回官方 App。绑定不过就停，不硬推。")
+            Text("「一键流程」= 首次绑定 → 等 isBound=1 → 等 5 秒 → 发握手（含版本上报）。绑定不过就停，不硬推。不自动发亮度、也不会自动断开。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
             Button {
                 ble.runOfficialFlow()
             } label: {
-                Text("一键：绑定 → 亮度 → 让回")
+                Text("一键：绑定 → 握手 → 去眼镜选会记")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -279,9 +303,9 @@ struct RootView: View {
 
             Toggle(isOn: $ble.runInitAfterBind) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(ble.runInitAfterBind ? "绑定后再跑 21 步初始化" : "绑定后直接发命令（默认）")
+                    Text(ble.runInitAfterBind ? "绑定后发完整握手（必须开着）" : "只补发版本号（最小修复）")
                         .font(.subheadline)
-                    Text("那 21 步是官方走 SPP 时的会话初始化，里面混着切页面指令，可能把命令吃掉")
+                    Text("关掉会让「会记」报 APP 版本过低 —— 那 21 步里第 4 步就是版本上报，还有语言表/模块声明")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -376,7 +400,7 @@ struct RootView: View {
             } else {
                 Text(ble.connectedName == nil
                      ? "先在上面连上眼镜"
-                     : "跑完一键流程后：① 看亮度变没变（1 档应该明显变暗）；② 等它自动断开；③ 去官方 App 点「会记」，看是不是又能听、能计时了。")
+                     : "跑完一键流程后：① 确认日志滚到「初始化发送完毕」；② 去眼镜菜单选「会记」；③ 断了就把日志发我。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

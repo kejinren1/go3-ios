@@ -58,11 +58,15 @@ final class GO3Central: NSObject, ObservableObject {
     @Published var useWriteResponse = false
 
     /// 绑定成功后要不要继续跑那 21 步初始化。
-    /// **默认关**。理由：那 21 步是官方「已经绑定好、走 SPP 通道」时的会话初始化，
-    /// 里面混着 SPEECH_INSCRIPTION（切显示页面）这类副作用，很可能把眼镜切到提词器界面、
-    /// 反而让后面的 CONTROL_COMMAND 被忽略。
-    /// 先用「绑定 → 直接发命令」这个最小组合验证 BLE 通道到底能不能带业务命令。
-    @Published var runInitAfterBind = false
+    ///
+    /// ── 2026-11-17 23:29 实测后**改回默认开** ──
+    /// P7 曾把它默认关掉，理由是「怕 SPEECH_INSCRIPTION 切页面吃命令」，那是猜的。
+    /// 23:29 这次跳过 21 步后，眼镜菜单里的「会记」直接报「APP 版本过低无法打开」。
+    /// 原因找到了：初始化第 4 步就是
+    ///   `BLE_CONNECT_BIND{ kind=7(PHONE_INFO), f7=PhoneInfo{ f1="3.0.455" } }`
+    /// —— 眼镜靠这条知道对端 App 的版本号。不发，它就认为版本过低。
+    /// 那 21 步不是"会话初始化"的装饰，是**让眼镜相信对面是正版 App 的握手**，不能跳。
+    @Published var runInitAfterBind = true
 
     /// 收到的帧数。这是判断"眼镜到底有没有在跟我们说话"最直接的指标：
     /// 长按 GO 键说了话之后如果这个数不涨，就是它根本没把 ASR 发出来，
@@ -74,16 +78,15 @@ final class GO3Central: NSObject, ObservableObject {
     /// 没绑定时亮度没反应，绑定后长按 GO 键从"要连接 INMO APP"变成"我在听"）。
     private var testAfterInit = false
 
-    /// ── P8：会话让回 ──────────────────────────────────────────────
-    /// 为什么必须做这个：眼镜屏幕上的「会记 / AI 对话 / 翻译 / 演讲提词」**不是眼镜自己算的**。
-    /// logcat 铁证：`InmoTranslateAsrClient: asr start Connected,zh` 之后才有
-    /// `翻译模块asr断句内容：{"code":"200",...}` —— 采音、Opus 编码在眼镜，
-    /// 语音识别和大模型全在**手机 App**里跑、调云端。
+    /// ── 定时断开（**默认关**，仅调试用）──────────────────────────
+    /// 23:29 实测事故：P8 上一版把它默认开成 12 秒，用户刚绑定完准备去眼镜菜单点
+    /// 「会记」，12 秒一到我方主动 `cancelPeripheralConnection`，眼镜屏幕上就跳出
+    /// "蓝牙已断开"。日志里那行「⏳ 到点，主动断开」就是它干的，不是眼镜踢我们。
     ///
-    /// 所以「我们的 App 长期占着 BLE + 官方 App 干活」这个组合不成立：
-    /// 官方 App 被挤下线，眼镜就等于被拔了脑子 —— 这就是用户说的「像没联网一样」。
-    /// 唯一可行的用法是「用完即断」：连上 → 干活 → 立刻撒手，让官方 App 接手。
-    @Published var autoRelease = true
+    /// 更要紧的是：**绑定由我们这个 App 完成，官方 App 不是这条链路的一环**
+    /// （用户 23:32 明确纠正）。眼镜只认账号绑定状态，谁连上谁就能用。
+    /// 所以「赶紧断开放手给官方 App」这个思路作废 —— 我们要一直在线。
+    @Published var autoRelease = false
     /// 干完活后留几秒再断。留一点是因为亮度变化要人眼确认。
     @Published var releaseAfter: Double = 12
 
@@ -155,7 +158,7 @@ final class GO3Central: NSObject, ObservableObject {
         devices.removeAll()
         found.removeAll()
         scanning = true
-        append("开始扫描。眼镜要开机、并且尽量别和官方 App 抢连接。")
+        append("开始扫描。眼镜要开机、亮屏，并且在眼镜上退出其他界面。")
         central.scanForPeripherals(
             withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
@@ -261,33 +264,34 @@ final class GO3Central: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - 会话让回（P8）
+    // MARK: - 定时断开（调试用）
 
     /// 排一个「到点自动断开」的定时器。
-    /// 这不是礼貌，是硬需求：iOS 一个外设同时只服务一个 central，
-    /// 我们只要还连着，官方 App 就拿不到音频流，眼镜的会记/提词全都瘫着。
+    /// **默认不启用**。启用后眼镜会在到点时看到"蓝牙已断开"，
+    /// 23:29 那次就是它在用户刚要打开「会记」时把连接掐了，属于自伤。
+    /// 只在做长连接泄漏/重连测试时才打开。
     func scheduleRelease(seconds: Double, reason: String) {
         guard autoRelease else {
-            append("  （自动让回已关闭：连接会一直占着，官方 App 在此期间用不了）")
+            append("  （定时断开未启用：连接会一直保持）")
             return
         }
         releaseWork?.cancel()
         let secs = max(2, seconds)
-        append("  ⏳ \(Int(secs)) 秒后自动断开，把连接让回官方 App（\(reason)）")
+        append("  ⏳ [调试] \(Int(secs)) 秒后主动断开（\(reason)）")
         let w = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            self.append("  ⏳ 到点，主动断开。现在去官方 App 点「会记」，应该恢复正常。")
+            self.append("  ⏳ [调试] 到点主动断开 —— 眼镜屏幕上会显示蓝牙断开，这是预期内的")
             self.disconnect()
         }
         releaseWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + secs, execute: w)
     }
 
-    /// 立刻撒手。用户想马上把眼镜还给官方 App 时按这个。
+    /// 立刻断开。做重连测试或换设备时用。
     func releaseNow() {
         releaseWork?.cancel()
         releaseWork = nil
-        append("→ 手动释放连接，把眼镜交回官方 App")
+        append("→ 手动断开连接")
         disconnect()
     }
 
@@ -352,16 +356,64 @@ final class GO3Central: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - 上报 App 版本（「APP 版本过低」的唯一解药）
+
+    /// 上报给眼镜的 App 版本号。
+    /// 默认 `3.0.455` —— 这是官方 App 抓包时真实发出的值（`app_init_wire.json` 第 4 步，
+    /// 原文 `3a 0b 0a 07 33 2e 30 2e 34 35 35` → "3.0.455"）。
+    /// 眼镜固件是 `Go3_DC_V3.0.406`，如果 3.0.455 仍被判过低，就往上调（如 3.0.500）。
+    @Published var phoneVersion = "3.0.455"
+
+    /// 造一条 `BLE_CONNECT_BIND{ kind=7(PHONE_INFO), f7=PhoneInfo{ f1=version, f2=1 } }`。
+    /// 逐字节对齐官方抓包：
+    ///   `10 18 | da 01 0f | 08 07 | 3a 0b | 0a 07 "3.0.455" | 10 01`
+    /// 其中 f2=1 的含义没查清（可能是平台或 App 类型），照抄抓包值不动。
+    private func phoneInfoPayload(version: String) -> [UInt8] {
+        var v = Array(version.utf8)
+        if v.count > 40 { v = Array(v.prefix(40)) }
+
+        var pi: [UInt8] = [0x0A, UInt8(v.count & 0xFF)]
+        pi.append(contentsOf: v)
+        pi.append(contentsOf: [0x10, 0x01])
+
+        var inner: [UInt8] = [0x08, 0x07, 0x3A, UInt8(pi.count & 0xFF)]
+        inner.append(contentsOf: pi)
+
+        var out: [UInt8] = [0x10, 0x18, 0xDA, 0x01]   // f2=24(msgType) + f27 起始
+        var n = inner.count
+        while n >= 0x80 {                              // varint 长度
+            out.append(UInt8((n & 0x7F) | 0x80))
+            n >>= 7
+        }
+        out.append(UInt8(n))
+        out.append(contentsOf: inner)
+        return out
+    }
+
+    /// 单独补发一条版本上报。绑定成功后、或者眼镜已经在抱怨版本过低时都能用。
+    func sendPhoneInfo() {
+        guard let ch = targetChannel else {
+            append("还没连上眼镜，先连接")
+            return
+        }
+        let p = phoneInfoPayload(version: phoneVersion)
+        append("→ 上报 App 版本：\(phoneVersion)（眼镜就是靠这条判断「APP 版本过低」）")
+        sendPayload(p, ch: ch, label: "BLE_CONNECT_BIND PHONE_INFO v\(phoneVersion)")
+    }
+
     /// 完整流程，严格按官方顺序：
-    /// 发 BIND_USERDATA → 等 BIND_STATUS_RESPONSE → isBound=1 → 等 5 秒 → 发 21 步 → 等 2 秒 → 亮度自检。
+    /// 发 BIND_USERDATA → 等 BIND_STATUS_RESPONSE → isBound=1 → 等 5 秒 → 发 21 步。
     /// 绑定失败就停，不再往下发——22:31 那次就是在未绑定状态硬推初始化，
     /// 结果眼镜回 UNBIND 并断开，屏幕上显示"连接失败"。
+    ///
+    /// 不再自动补一枪亮度：那会改屏幕显示，干扰「去眼镜菜单打开会记」的判断。
+    /// 亮度仍是手动按钮，要验投递时再点。
     func runOfficialFlow() {
         guard connectedPeripheral?.state == .connected, targetChannel != nil else {
             append("一键流程要先连上眼镜")
             return
         }
-        testAfterInit = true
+        testAfterInit = false
         append("—— 一键流程开始 ——")
         sendBind(kind: 2)
     }
@@ -379,18 +431,20 @@ final class GO3Central: NSObject, ObservableObject {
                 }
                 stage = .waitingInit
                 if runInitAfterBind {
-                    append("  → 按官方时序等 5 秒再发 21 步初始化")
+                    append("  → 按官方时序等 5 秒再发 21 步（第 1 步的绑定我们刚发过，会跳过）")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
                         guard let self = self, self.stage == .waitingInit else { return }
                         self.append("  → 5 秒到，开始发初始化")
-                        self.sendInit(firstOnly: false)
+                        self.sendInit(firstOnly: false, skipFirstBind: true)
                     }
                 } else {
-                    append("  → 跳过 21 步初始化（开关关着），2 秒后直接发亮度命令")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    append("  → 不跑 21 步，只补一条 PHONE_INFO 上报版本 \(phoneVersion)")
+                    append("  → 注意：只发版本号是「最小修复」，眼镜要的其他能力（语言表/模块声明）还是缺，能进界面不等于能用")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                         guard let self = self, self.stage == .waitingInit else { return }
+                        self.sendPhoneInfo()
                         self.stage = .idle
-                        self.sendBrightness(level: 1)
+                        self.append("  → 完成。现在去眼镜菜单选「会记」，看还报不报「APP 版本过低」。")
                     }
                 }
             } else {
@@ -438,10 +492,9 @@ final class GO3Central: NSObject, ObservableObject {
     }
 
     /// firstOnly = true 时只发第 1 步（BLE_CONNECT_BIND）。
-    /// 为什么要有这个开关：绑定帧里带 user_account，是最可能让眼镜"认下"
-    /// 这个 App 的一步；先只发它，能干净地判断「是不是就缺这一下」，
-    /// 而不是一口气推 21 帧、出了问题分不清是哪一步的锅。
-    func sendInit(firstOnly: Bool) {
+    /// skipFirstBind = true 时把第 1 步剔掉 —— 一键流程里我们已经单独发过绑定，
+    /// 再发一遍只会让眼镜回两次 BIND_STATUS_RESPONSE，纯噪音。
+    func sendInit(firstOnly: Bool, skipFirstBind: Bool = false) {
         guard let p = connectedPeripheral, p.state == .connected else {
             append("还没连上眼镜，先连接再发")
             return
@@ -456,7 +509,8 @@ final class GO3Central: NSObject, ObservableObject {
             return
         }
 
-        let list = firstOnly ? Array(InitSequence.steps.prefix(1)) : InitSequence.steps
+        var list = firstOnly ? Array(InitSequence.steps.prefix(1)) : InitSequence.steps
+        if skipFirstBind { list = list.filter { $0.idx != 1 } }
         append("开始发送初始化：\(list.count) 步，通道 \(short(ch.uuid))，单次写入上限 \(maxWriteLength(ch))B")
         append("  信封：type=0x00 src=3 dst=1，\(keepVersionPrefix ? "带" : "不带") 08 01 版本前缀")
         if !firstOnly {
@@ -497,6 +551,9 @@ final class GO3Central: NSObject, ObservableObject {
             initRunning = false
             stage = .idle
             append("初始化发送完毕（\(list.count) 步）")
+            append("  ✔ 里面已包含 PHONE_INFO v\(phoneVersion)，眼镜现在应该认为对端是正版 App 了")
+            append("  → 现在去**眼镜菜单里选「会记」**，看还报不报「APP 版本过低无法打开」。")
+            append("  → 连接会一直保持，不会自己断（定时断开默认关着）。")
             if testAfterInit {
                 testAfterInit = false
                 append("2 秒后自动发亮度自检——这次是在绑定之后发的，意义完全不同")
@@ -639,7 +696,7 @@ extension GO3Central: CBCentralManagerDelegate {
         stage = .idle
         releaseWork?.cancel()
         releaseWork = nil
-        append("  已撒手。官方 App 应该能在几秒内自己重连上 —— 这时点「会记」看能不能听、计时走不走。")
+        append("  连接已断。如果不是你手动断的，重点看断之前最后几帧眼镜发了什么。")
     }
 }
 
@@ -694,19 +751,16 @@ extension GO3Central: CBPeripheralDelegate {
             }
         }
 
-        // 连上之后第一件事不是发命令，是先做一个单变量实验，把根因钉死。
-        // 用户 23:07 实测：我们的 App 连着时，眼镜屏幕上的「会记」不听、不计时；
-        // 把我们关掉，官方 App 立刻恢复。但那时是「连+绑定+21步+命令」全干了，
-        // 分不清是"占连接"还是"写坏了"。这一步就是把它拆开。
+        // 连上之后给一段"正确顺序"的提示。
+        // 23:29 那次就是顺序错了（跳过 21 步 → 缺 PHONE_INFO → 眼镜报「APP 版本过低」），
+        // 所以这里直接把正确顺序写在日志里，不用记。
         if !experimentHintShown, (rwChar2021 != nil || writeChar1001 != nil) {
             experimentHintShown = true
-            append("──── 单变量实验（请按顺序做）────")
-            append("① 现在什么都别按，直接去官方 App 点「会记」：")
-            append("   · 如果也不听 → 光是占住 BLE 连接就会把它挤掉，只能「用完即断」")
-            append("   · 如果正常   → 那就是我们的写入搞坏的，继续第 ② 步")
-            append("② 回来按「首次绑定」，再试官方 App 的「会记」")
-            append("③ 还正常就按亮度按钮，再试一次")
-            append("哪一步开始坏，问题就在那一步 —— 不用再猜。")
+            append("──── 正确顺序（绑定由我们这个 App 完成，官方 App 不参与）────")
+            append("① 点「首次绑定」，等日志出现 isBound=1")
+            append("② 它会自动等 5 秒，然后发 \(InitSequence.steps.count) 步握手（含 PHONE_INFO v\(phoneVersion)）")
+            append("③ 去**眼镜菜单**选「会记」")
+            append("④ 连接会一直保持。若还报「APP 版本过低」，把版本号调高再单独点「补发版本」")
         }
     }
 
