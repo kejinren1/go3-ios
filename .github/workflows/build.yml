@@ -1,0 +1,91 @@
+name: ios-ipa
+
+# 为什么是在 CI 里编译：
+#   iOS App 只能由 macOS 上的 Xcode 编译，本机是 Windows。
+#   公开仓库的 macOS runner 免费，所以借它当编译机。
+#
+# 为什么在 CI 里「不签名」：
+#   签名需要 Apple 开发者证书；放进 CI 得把 .p12 塞进 Secrets，麻烦且有泄漏风险。
+#   所以这里只出**未签名**的 .ipa，回到 Windows 用 Sideloadly + 免费 Apple ID 签。
+#   这条组合的代价是 $0，代价之外的代价是每 7 天要重签一次。
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境自检
+        run: |
+          sw_vers
+          echo "----- Xcode -----"
+          xcodebuild -version
+          echo "----- iOS SDK -----"
+          xcodebuild -showsdks | grep -i "iphoneos" || true
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        run: |
+          xcodegen generate
+          ls -la
+
+      - name: 编译（不签名）
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project GO3Bridge.xcodeproj \
+            -scheme GO3Bridge \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build 2>&1 | tee xcodebuild.log | tail -60
+
+      - name: 失败时回传完整日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: 打包成 ipa
+        run: |
+          APP="build/Build/Products/Release-iphoneos/GO3Bridge.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::没找到 .app，编译产物目录："
+            ls -R build/Build/Products || true
+            exit 1
+          fi
+          rm -rf Payload GO3Bridge.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry GO3Bridge.ipa Payload
+          echo "----- 产物 -----"
+          ls -lh GO3Bridge.ipa
+          unzip -l GO3Bridge.ipa | head -20
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: GO3Bridge-ipa
+          path: GO3Bridge.ipa
+          if-no-files-found: error

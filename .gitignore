@@ -1,0 +1,18 @@
+# 编译产物
+build/
+*.ipa
+Payload/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+
+# XcodeGen 生成的，不入库（工程定义在 project.yml 里）
+GO3Bridge/Info.plist
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 日志
+xcodebuild.log
+*.log

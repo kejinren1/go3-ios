@@ -1,0 +1,59 @@
+name: GO3Bridge
+
+options:
+  bundleIdPrefix: com.go3bridge
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  GO3Bridge:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: GO3Bridge
+        excludes:
+          - "Info.plist"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.go3bridge.app
+        PRODUCT_NAME: GO3Bridge
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: GO3Bridge/Info.plist
+      properties:
+        CFBundleDisplayName: GO3 Bridge
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSBluetoothAlwaysUsageDescription: 需要蓝牙来连接 INMO GO3 眼镜
+        NSBluetoothPeripheralUsageDescription: 需要蓝牙来连接 INMO GO3 眼镜
+        NSMicrophoneUsageDescription: 需要麦克风来听取你的语音指令
+        NSSpeechRecognitionUsageDescription: 需要语音识别把你说的话转成文字
+        UIBackgroundModes:
+          - bluetooth-central
+
+schemes:
+  GO3Bridge:
+    build:
+      targets:
+        GO3Bridge: all
+    run:
+      config: Debug
+    archive:
+      config: Release
