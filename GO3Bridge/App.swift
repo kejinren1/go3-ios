@@ -106,7 +106,7 @@ struct RootView: View {
                 .font(.headline)
 
             if ble.devices.isEmpty {
-                Text("点右上角「扫描」。眼镜要开机亮屏；如果手机上装了官方 INMO App，先划掉它，免得抢同一个连接。")
+                Text("点右上角「扫描」。眼镜要开机亮屏。一个蓝牙外设同一时刻只能被一个 App 连着，若别的 App 也连在眼镜上，先让它断开。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
@@ -236,6 +236,18 @@ struct RootView: View {
                 }
                 .buttonStyle(.bordered)
             }
+            .font(.subheadline)
+            .disabled(ble.connectedName == nil)
+
+            // 先问一句「现在绑没绑」，比盲猜发 BIND_USERDATA 还是 BACK_LINK 靠谱。
+            // 眼镜的 BIND_STATUS_RESPONSE 三种 kind 都回同一种消息，所以发查询也一样解。
+            Button {
+                ble.sendBind(kind: 0)
+            } label: {
+                Text("查询当前绑定状态")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
             .font(.subheadline)
             .disabled(ble.connectedName == nil)
 

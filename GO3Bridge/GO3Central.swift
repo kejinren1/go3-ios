@@ -349,7 +349,10 @@ final class GO3Central: NSObject, ObservableObject {
             append("还没连上眼镜，先连接")
             return
         }
-        let name = kind == 2 ? "BIND_USERDATA(2) 首次绑定" : "BACK_LINK(1) 回连"
+        bindIsQuery = (kind == 0)
+        let name = kind == 2 ? "BIND_USERDATA(2) 首次绑定"
+                 : kind == 1 ? "BACK_LINK(1) 回连"
+                 : "QUERY(0) 查询绑定状态"
         append("→ 发绑定：\(name)，userAccount=\"\(userAccount)\"")
         sendPayload(bindPayload(kind: kind), ch: ch, label: "BLE_CONNECT_BIND \(name)")
         stage = .waitingBind
@@ -357,6 +360,11 @@ final class GO3Central: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
             guard let self = self, self.stage == .waitingBind else { return }
             self.stage = .idle
+            if self.bindIsQuery {
+                self.bindIsQuery = false
+                self.append("6 秒内没等到查询回包。眼镜可能不支持 kind=0，直接点「首次绑定」即可。")
+                return
+            }
             if autoFallback, self.bindTries < 2 {
                 self.append("6 秒内没等到绑定响应。改发一条「回连」试试（眼镜保留着上次的绑定）")
                 self.sendBind(kind: kind == 2 ? 1 : 2, autoFallback: false)
@@ -368,6 +376,8 @@ final class GO3Central: NSObject, ObservableObject {
 
     /// 一次连接内最多试几次绑定，防止两种 kind 互相触发无限循环。
     private var bindTries = 0
+    /// 当前这条绑定是不是「查状态」，是的话回包只报状态、不驱动握手。
+    private var bindIsQuery = false
 
     // MARK: - 上报 App 版本（「APP 版本过低」的唯一解药）
 
@@ -438,6 +448,15 @@ final class GO3Central: NSObject, ObservableObject {
         case 3: // BIND_STATUS_RESPONSE
             if rep.isBound {
                 bindTries = 0
+                // 查询（kind=0）的回包只报告状态，不触发握手，否则点一下「查一下」就会
+                // 莫名其妙开始发 21 步，容易把人搞懵。
+                if bindIsQuery {
+                    bindIsQuery = false
+                    stage = .idle
+                    append("  → 查询结果：这台眼镜已绑在账号 \(rep.boundUserId) 上。")
+                    append("  → 不需要重新绑定，直接点「一键流程」或「发全部 \(InitSequence.steps.count) 步」即可。")
+                    return
+                }
                 append("  → 绑定成功。")
                 guard stage == .waitingBind else {
                     stage = .idle
@@ -462,6 +481,13 @@ final class GO3Central: NSObject, ObservableObject {
                     }
                 }
             } else {
+                if bindIsQuery {
+                    bindIsQuery = false
+                    stage = .idle
+                    append("  → 查询结果：这台眼镜当前没有绑定（\(rep.hint)）。")
+                    append("  → 点「首次绑定」建立绑定。")
+                    return
+                }
                 append("  → 绑定未通过：\(rep.hint)")
                 append("  → 先别发初始化。官方在未绑定状态下会直接断开，硬发只会把连接搞崩。")
                 if stage == .waitingBind { stage = .idle }
@@ -716,6 +742,7 @@ extension GO3Central: CBCentralManagerDelegate {
         testAfterInit = false
         stage = .idle
         bindTries = 0
+        bindIsQuery = false
         releaseWork?.cancel()
         releaseWork = nil
         append("  连接已断。如果不是你手动断的，重点看断之前最后几帧眼镜发了什么。")
