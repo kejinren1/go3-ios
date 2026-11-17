@@ -20,6 +20,7 @@ struct RootView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     statusCard
                     deviceSection
+                    sessionSection
                     bindSection
                     initSection
                     logSection
@@ -137,6 +138,62 @@ struct RootView: View {
         }
     }
 
+    // MARK: - 会话让回
+
+    /// 这一块是 P8 的核心，也是理解整件事的钥匙。
+    /// 眼镜屏幕上的「会记 / AI 对话 / 翻译 / 演讲提词」不是眼镜自己算的：
+    /// logcat 里 `InmoTranslateAsrClient: asr start Connected,zh` 之后才有
+    /// `翻译模块asr断句内容：{"code":"200",...}` —— 采音在眼镜，识别和大模型在手机 App。
+    /// 我们占着 BLE 连接，官方 App 就上不去，眼镜等于被拔了脑子。
+    /// 所以这里只做一件事：干完活就撒手。
+    private var sessionSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("会话让回")
+                .font(.headline)
+
+            Text("眼镜的会记/翻译/提词靠的是手机 App 调云端，不是眼镜自己算。我们连着不放，官方 App 就起不来，那些功能必然瘫着——你看到的「像没联网一样」就是这个。所以必须用完即断。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            Toggle(isOn: $ble.autoRelease) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ble.autoRelease ? "干完活自动断开（推荐）" : "一直连着（官方 App 会一直不可用）")
+                        .font(.subheadline)
+                    Text("断得越快，眼镜越快回到能用的状态")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Text("停留")
+                    .font(.subheadline)
+                Slider(value: $ble.releaseAfter, in: 5...40, step: 1)
+                Text("\(Int(ble.releaseAfter)) 秒")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .frame(width: 52, alignment: .trailing)
+            }
+            .disabled(!ble.autoRelease)
+
+            Button {
+                ble.releaseNow()
+            } label: {
+                Text("立刻把眼镜交回官方 App")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(ble.connectedName == nil)
+
+            Text("连上之后日志里会有一段「单变量实验」，按它三步走一遍，就能确定到底是「占连接」还是「写坏了」。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
     // MARK: - 绑定
 
     /// 这一步是闸门。
@@ -207,14 +264,14 @@ struct RootView: View {
             Text("初始化握手")
                 .font(.headline)
 
-            Text("「一键流程」= 首次绑定 → 等绑定响应 → isBound=1 → 2 秒后发亮度（默认跳过 21 步）。绑定不过就停，不硬推。")
+            Text("「一键流程」= 首次绑定 → 等绑定响应 → isBound=1 → 2 秒后发亮度 → 到点自动断开让回官方 App。绑定不过就停，不硬推。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
             Button {
                 ble.runOfficialFlow()
             } label: {
-                Text("一键：绑定 → 亮度自检")
+                Text("一键：绑定 → 亮度 → 让回")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -319,7 +376,7 @@ struct RootView: View {
             } else {
                 Text(ble.connectedName == nil
                      ? "先在上面连上眼镜"
-                     : "跑完一键流程后：① 看亮度变没变成 30；② 长按 GO 键说句话，看上面「已收到 N 帧」涨不涨。")
+                     : "跑完一键流程后：① 看亮度变没变（1 档应该明显变暗）；② 等它自动断开；③ 去官方 App 点「会记」，看是不是又能听、能计时了。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

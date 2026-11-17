@@ -74,6 +74,23 @@ final class GO3Central: NSObject, ObservableObject {
     /// 没绑定时亮度没反应，绑定后长按 GO 键从"要连接 INMO APP"变成"我在听"）。
     private var testAfterInit = false
 
+    /// ── P8：会话让回 ──────────────────────────────────────────────
+    /// 为什么必须做这个：眼镜屏幕上的「会记 / AI 对话 / 翻译 / 演讲提词」**不是眼镜自己算的**。
+    /// logcat 铁证：`InmoTranslateAsrClient: asr start Connected,zh` 之后才有
+    /// `翻译模块asr断句内容：{"code":"200",...}` —— 采音、Opus 编码在眼镜，
+    /// 语音识别和大模型全在**手机 App**里跑、调云端。
+    ///
+    /// 所以「我们的 App 长期占着 BLE + 官方 App 干活」这个组合不成立：
+    /// 官方 App 被挤下线，眼镜就等于被拔了脑子 —— 这就是用户说的「像没联网一样」。
+    /// 唯一可行的用法是「用完即断」：连上 → 干活 → 立刻撒手，让官方 App 接手。
+    @Published var autoRelease = true
+    /// 干完活后留几秒再断。留一点是因为亮度变化要人眼确认。
+    @Published var releaseAfter: Double = 12
+
+    private var releaseWork: DispatchWorkItem?
+    /// 「单变量实验」提示只打一次，免得每个服务枚举完都刷一遍。
+    private var experimentHintShown = false
+
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
@@ -231,6 +248,7 @@ final class GO3Central: NSObject, ObservableObject {
         sendPayload([0x10, 0x0B, 0x72, 0x08, 0x08, 0x01, 0x1A, 0x04, 0x08, 0x01, 0x28, lv],
                     ch: ch, label: "CONTROL_COMMAND 亮度\(lv)")
         observeAfterCommand()
+        scheduleRelease(seconds: releaseAfter, reason: "亮度命令已发完")
     }
 
     /// 发完命令后看眼镜有没有动静。这是判断"写到底有没有被消费"最直接的办法：
@@ -241,6 +259,36 @@ final class GO3Central: NSObject, ObservableObject {
             guard let self = self else { return }
             self.append("  ▸ 命令发出后 3 秒：新收到 \(self.rxCount - before) 帧")
         }
+    }
+
+    // MARK: - 会话让回（P8）
+
+    /// 排一个「到点自动断开」的定时器。
+    /// 这不是礼貌，是硬需求：iOS 一个外设同时只服务一个 central，
+    /// 我们只要还连着，官方 App 就拿不到音频流，眼镜的会记/提词全都瘫着。
+    func scheduleRelease(seconds: Double, reason: String) {
+        guard autoRelease else {
+            append("  （自动让回已关闭：连接会一直占着，官方 App 在此期间用不了）")
+            return
+        }
+        releaseWork?.cancel()
+        let secs = max(2, seconds)
+        append("  ⏳ \(Int(secs)) 秒后自动断开，把连接让回官方 App（\(reason)）")
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.append("  ⏳ 到点，主动断开。现在去官方 App 点「会记」，应该恢复正常。")
+            self.disconnect()
+        }
+        releaseWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + secs, execute: w)
+    }
+
+    /// 立刻撒手。用户想马上把眼镜还给官方 App 时按这个。
+    func releaseNow() {
+        releaseWork?.cancel()
+        releaseWork = nil
+        append("→ 手动释放连接，把眼镜交回官方 App")
+        disconnect()
     }
 
     private var targetChannel: CBCharacteristic? {
@@ -491,6 +539,12 @@ final class GO3Central: NSObject, ObservableObject {
     }
 
     func disconnect() {
+        releaseWork?.cancel()
+        releaseWork = nil
+        if let p = connectedPeripheral {
+            central.cancelPeripheralConnection(p)
+            return
+        }
         for (_, p) in found where p.state == .connected {
             central.cancelPeripheralConnection(p)
         }
@@ -553,6 +607,7 @@ extension GO3Central: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         connectedPeripheral = peripheral
         connectedName = peripheral.name ?? peripheral.identifier.uuidString
+        experimentHintShown = false
         append("已连接 \(connectedName ?? "")，开始枚举服务")
         // 把包构造器和官方真实捕获的那条帧逐字节比一次。
         // 这行如果显示"不一致"，后面发什么都白费，先修构造器。
@@ -582,6 +637,9 @@ extension GO3Central: CBCentralManagerDelegate {
         seqCounter = 1
         testAfterInit = false
         stage = .idle
+        releaseWork?.cancel()
+        releaseWork = nil
+        append("  已撒手。官方 App 应该能在几秒内自己重连上 —— 这时点「会记」看能不能听、计时走不走。")
     }
 }
 
@@ -634,6 +692,21 @@ extension GO3Central: CBPeripheralDelegate {
                 append("      读一次当前值\(tag)")
                 peripheral.readValue(for: c)
             }
+        }
+
+        // 连上之后第一件事不是发命令，是先做一个单变量实验，把根因钉死。
+        // 用户 23:07 实测：我们的 App 连着时，眼镜屏幕上的「会记」不听、不计时；
+        // 把我们关掉，官方 App 立刻恢复。但那时是「连+绑定+21步+命令」全干了，
+        // 分不清是"占连接"还是"写坏了"。这一步就是把它拆开。
+        if !experimentHintShown, (rwChar2021 != nil || writeChar1001 != nil) {
+            experimentHintShown = true
+            append("──── 单变量实验（请按顺序做）────")
+            append("① 现在什么都别按，直接去官方 App 点「会记」：")
+            append("   · 如果也不听 → 光是占住 BLE 连接就会把它挤掉，只能「用完即断」")
+            append("   · 如果正常   → 那就是我们的写入搞坏的，继续第 ② 步")
+            append("② 回来按「首次绑定」，再试官方 App 的「会记」")
+            append("③ 还正常就按亮度按钮，再试一次")
+            append("哪一步开始坏，问题就在那一步 —— 不用再猜。")
         }
     }
 
