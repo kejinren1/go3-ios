@@ -36,20 +36,22 @@
 
 ## 二、第一次跑通（P0：只验证"能装"）
 
-### 1. 建仓库并推上去
+### 1. 仓库（已建好）
+
+仓库已经是公开的：<https://github.com/kejinren1/go3-ios>
 
 ```bash
 cd go3-ios
-git init -b main
-git add .
-git commit -m "P0: 骨架与 CI 出包流水线"
-gh repo create go3-ios --public --source=. --push
-# 或者手动在 GitHub 建空仓库，然后：
-# git remote add origin git@github.com:<你>/go3-ios.git && git push -u origin main
+git push            # 平时只需要这句，推上去 CI 就自动编译
 ```
 
 **必须是 public 仓库** —— 公开仓库的 macOS runner 分钟数免费，私有仓库要走付费额度
 （macOS 分钟按 10 倍计费）。
+
+> 踩过的坑：这台机器走 HTTP 代理，`github.com` 偶尔会返回
+> `CONNECT tunnel failed, response 502`。这是代理抖动，不是权限问题。
+> 隔几十秒重试就能过，已经在 `.git/config` 里把 `http.postBuffer`
+> 调大、`http.version` 锁 HTTP/1.1 减轻影响。
 
 ### 2. 等 Actions 跑绿
 
