@@ -74,6 +74,12 @@ struct RootView: View {
                         .font(.caption)
                 }
             }
+
+            // 眼镜是不是真的在跟我们说话，看这个数最省事。
+            // 长按 GO 键说完一句话之后它不涨，说明是眼镜没发 ASR，不是我们没解析。
+            Text("已收到 \(ble.rxCount) 帧（眼镜主动发来的）")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
         .padding(12)
         .background(Color(.secondarySystemBackground))
@@ -144,17 +150,26 @@ struct RootView: View {
             Text("初始化握手")
                 .font(.headline)
 
-            Text("先点「投递自检」——它发的是官方真实抓到的「亮度 30」命令，效果立刻可见。屏幕变了，才说明通道和信封都对；这一步不过，后面发初始化没有意义。")
+            Text("先点「一键流程」——它按正确顺序先发全量初始化（绑定），等 2 秒再发亮度自检。绑定前发命令眼镜是直接丢的。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
             Button {
-                ble.sendBrightnessTest()
+                ble.runFullThenTest()
             } label: {
-                Text("投递自检：把亮度设成 30")
+                Text("一键：全量初始化 → 亮度自检")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!canSendInit)
+
+            Button {
+                ble.sendBrightnessTest()
+            } label: {
+                Text("只发自检：把亮度设成 30")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
             .disabled(!canSendInit)
 
             Divider()
@@ -223,7 +238,7 @@ struct RootView: View {
             } else {
                 Text(ble.connectedName == nil
                      ? "先在上面连上眼镜"
-                     : "顺序：投递自检（看屏幕亮度）→ 只发第 1 步 → 还不消失就发全部 21 步。")
+                     : "跑完一键流程后：① 看亮度变没变成 30；② 长按 GO 键说句话，看上面「已收到 N 帧」涨不涨。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

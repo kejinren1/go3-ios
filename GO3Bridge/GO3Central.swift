@@ -57,6 +57,16 @@ final class GO3Central: NSObject, ObservableObject {
     /// 否则永远分不清是信封错还是写方式错。
     @Published var useWriteResponse = false
 
+    /// 收到的帧数。这是判断"眼镜到底有没有在跟我们说话"最直接的指标：
+    /// 长按 GO 键说了话之后如果这个数不涨，就是它根本没把 ASR 发出来，
+    /// 而不是我们没解析。
+    @Published private(set) var rxCount = 0
+
+    /// 一键流程用：全量初始化发完后自动补一枪亮度自检。
+    /// 顺序很关键——绑定之前发命令，眼镜是直接丢的（用户 22:25 实测印证：
+    /// 没绑定时亮度没反应，绑定后长按 GO 键从"要连接 INMO APP"变成"我在听"）。
+    private var testAfterInit = false
+
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
@@ -207,6 +217,17 @@ final class GO3Central: NSObject, ObservableObject {
         useRW2021 ? rwChar2021 : writeChar1001
     }
 
+    /// 一键流程：全量初始化 → 等 2 秒 → 自动发亮度自检。
+    /// 把「先绑定、后发命令」这个顺序固化进代码，不靠人记。
+    func runFullThenTest() {
+        guard connectedPeripheral?.state == .connected, targetChannel != nil else {
+            append("一键流程要先连上眼镜")
+            return
+        }
+        testAfterInit = true
+        sendInit(firstOnly: false)
+    }
+
     /// 一次只发一段。无响应写没有回调，靠 20ms 让出主线程再发下一段；
     /// 有响应写则等 didWriteValueFor 把 writing 放开。
     private func pump() {
@@ -293,7 +314,14 @@ final class GO3Central: NSObject, ObservableObject {
                 return
             }
             initRunning = false
-            append("初始化发送完毕（\(list.count) 步）。看看眼镜还提不提示「下载 INMO App」")
+            append("初始化发送完毕（\(list.count) 步）")
+            if testAfterInit {
+                testAfterInit = false
+                append("2 秒后自动发亮度自检——这次是在绑定之后发的，意义完全不同")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    self?.sendBrightnessTest()
+                }
+            }
             return
         }
 
@@ -418,6 +446,7 @@ extension GO3Central: CBCentralManagerDelegate {
         queue.removeAll()
         writing = false
         seqCounter = 1
+        testAfterInit = false
     }
 }
 
@@ -481,6 +510,7 @@ extension GO3Central: CBPeripheralDelegate {
             return
         }
         guard let d = characteristic.value else { return }
+        rxCount += 1
 
         // 能按 aa55 帧解出来就解，解不出来就老实打 hex —— 不猜。
         if let f = GO3Frame.parse(d) {
