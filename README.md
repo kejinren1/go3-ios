@@ -62,25 +62,31 @@ Actions 页面 → `ios-ipa` → 最新一次运行。跑完后在页面底部 *
 
 ### 3. Windows 上装 Sideloadly 的前置
 
-Sideloadly 要靠苹果的移动设备服务才能跟 iPhone 通信，所以得先装：
+Sideloadly 要靠苹果的移动设备服务才能跟 iPhone 通信，需要
+`C:\Program Files\Common Files\Apple\Mobile Device Support` 这个目录存在。
+（本机已经有了，是随其它苹果软件装的，所以**不用再装 iTunes**。
+换机器的话：从 Apple 官网装 **iTunes**，别用 Microsoft Store 那个版本。）
 
-- 从 Apple 官网装 **iTunes**（不是 Microsoft Store 那个版本），或者
-- 装 **Apple Devices** 应用
-
-装完确认 `C:\Program Files\Common Files\Apple\Mobile Device Support` 这个目录存在。
-
-### 4. iPhone 上打开开发者模式（iOS 16+ 必须）
-
-设置 → 隐私与安全性 → 开发者模式 → 打开 → 重启 → 重启后确认。
-
-### 5. Sideloadly 签名安装
+### 4. Sideloadly 签名安装（先装 App，别急着找开发者模式）
 
 1. 从 <https://sideloadly.io> 下载，安装。
 2. 数据线连 iPhone，手机上点「信任此电脑」。
 3. Sideloadly 里把 `GO3Bridge.ipa` 拖进去，`Apple ID` 填你的**免费** Apple ID
    （建议专门注册一个备用账号，主账号密码不用交给第三方工具）。
 4. 点 Start，中途可能要输密码和双重验证码。
-5. 装完后首次启动会提示「不受信任的开发者」。
+5. 装完桌面会出现 App 图标，**先点它一次**（会弹出 "Developer Mode Required"，打不开，
+   这是对的）。
+
+### 5. 这时开发者模式才会出现（iOS 16+ 必须）
+
+> ⚠️ **踩过的坑**：开发者模式默认是**藏起来的**。苹果的设计是——只有手机装过至少一个
+> 开发者签名的 App（或连过 Xcode）之后，这个开关才会出现在设置里。
+> 所以顺序必须是「先装 App，再开开发者模式」，反过来永远找不到那个选项。
+
+1. 设置 → **隐私与安全性** → 滚到**最底部**（在「安全性」分组下，不在「通用」里）
+2. 点「开发者模式」→ 打开开关
+3. 点「重新启动」，等手机重启
+4. 重启后解锁，会弹「打开开发者模式?」→ 点「打开」→ 输锁屏密码
 
 ### 6. 信任证书
 
