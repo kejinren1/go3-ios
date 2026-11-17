@@ -1,5 +1,6 @@
 import Foundation
 import CoreBluetooth
+import UIKit
 
 /// GO3 眼镜的 GATT 坐标。
 /// 这些值不是猜的，是从安卓官方 App 的 smali 里挖出来、再用 bleak 实测验证过的，
@@ -74,6 +75,12 @@ final class GO3Central: NSObject, ObservableObject {
         d.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// CBUUID 太长会把日志撑爆，只留后 4 位：00002022-... → 2022
+    private func short(_ u: CBUUID) -> String {
+        let s = u.uuidString
+        return String(s.prefix(8)).suffix(4).uppercased()
+    }
+
     private func props(_ p: CBCharacteristicProperties) -> String {
         var out: [String] = []
         if p.contains(.read) { out.append("read") }
@@ -104,6 +111,14 @@ final class GO3Central: NSObject, ObservableObject {
         central.stopScan()
         scanning = false
         append("停止扫描，共看到 \(devices.count) 个设备")
+    }
+
+    /// 把整段日志塞进剪贴板。
+    /// 为什么要这个：日志要发给电脑端分析，截图会有识别误差，
+    /// 而帧的十六进制差一个字符就全错，所以必须走原文。
+    func copyLog() {
+        UIPasteboard.general.string = log.joined(separator: "\n")
+        append("已把 \(log.count) 行日志复制到剪贴板")
     }
 
     func connect(_ d: BleDevice) {
@@ -211,7 +226,7 @@ extension GO3Central: CBPeripheralDelegate {
         let services = peripheral.services ?? []
         append("发现 \(services.count) 个服务")
         for s in services {
-            append("  服务 \(s.uuid.uuidString)")
+            append("  服务 \(short(s.uuid))")
             peripheral.discoverCharacteristics(nil, for: s)
         }
     }
@@ -224,7 +239,7 @@ extension GO3Central: CBPeripheralDelegate {
             return
         }
         for c in service.characteristics ?? [] {
-            append("    特征 \(c.uuid.uuidString)  [\(props(c.properties))]")
+            append("    特征 \(short(c.uuid))  [\(props(c.properties))]")
 
             // 订阅通知：只读，不会改变眼镜状态。安卓那边靠这条拿 60 秒心跳。
             if c.properties.contains(.notify) || c.properties.contains(.indicate) {
@@ -234,6 +249,8 @@ extension GO3Central: CBPeripheralDelegate {
 
             // 2021 是唯一可读的那个，零风险，先读出来看看当前值。
             if c.properties.contains(.read) {
+                let tag = (c.uuid == GO3UUID.rw2021) ? "（读写口 2021）" : ""
+                append("      读一次当前值\(tag)")
                 peripheral.readValue(for: c)
             }
         }
@@ -243,11 +260,22 @@ extension GO3Central: CBPeripheralDelegate {
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
         if let error = error {
-            append("  ← \(characteristic.uuid.uuidString) 读取出错：\(error.localizedDescription)")
+            append("  ← \(short(characteristic.uuid)) 读取出错：\(error.localizedDescription)")
             return
         }
         guard let d = characteristic.value else { return }
-        append("  ← \(characteristic.uuid.uuidString)  \(d.count)B  \(hex(d))")
+
+        // 能按 aa55 帧解出来就解，解不出来就老实打 hex —— 不猜。
+        if let f = GO3Frame.parse(d) {
+            var line = "  ← \(short(characteristic.uuid))  \(f.summary)"
+            if let pb = f.pbBrief {
+                line += "  \(pb)"
+            }
+            append(line)
+            append("       \(hex(d))")
+        } else {
+            append("  ← \(short(characteristic.uuid))  \(d.count)B  \(hex(d))")
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral,
