@@ -45,6 +45,11 @@ targets:
         NSBluetoothPeripheralUsageDescription: 需要蓝牙来连接 INMO GO3 眼镜
         NSMicrophoneUsageDescription: 需要麦克风来听取你的语音指令
         NSSpeechRecognitionUsageDescription: 需要语音识别把你说的话转成文字
+        # ↓ 日志不再靠手抄：打开文件共享后，沙盒 Documents 里的 go3bridge.log
+        #   既能在「文件」App 里看到并分享，也能被电脑端 afc 直接拉走。
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSLocalNetworkUsageDescription: 需要局域网把日志实时送到电脑
         UIBackgroundModes:
           - bluetooth-central
 

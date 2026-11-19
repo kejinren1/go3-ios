@@ -188,8 +188,31 @@ enum SagenoteOut {
         return wrap(body)
     }
 
-    /// 把 Sagenote 塞进 `Message{ f2=43, f46=... }`。
-    /// 手机发出的帧不带 `08 01` 版本前缀（官方 95 条发送样本里都没有）。
+    /// 手机主动下发一条会记命令（START / STOP / PAUSE / RESUME）。
+    ///
+    /// 结构是照 ACK 反推的：
+    /// `Sagenote{ f1=COMMAND(0), f2=commandId, f3=sessionId, f4=now_ms, f10=Command{ f1=cmd, f2=source } }`
+    /// `source` 取 0=手机。`commandId` 用字符串，眼镜会原样回在 ACK 里，可以据此对账。
+    ///
+    /// **诚实标注**：官方抓包（`INTEL/sniff.log` 手机→眼镜方向）里没有 COMMAND 样本，
+    /// 只有 ACK / STATE / ASR / 外层包裹这四类逐字节对过。所以这条是**推定结构**，
+    /// 界面上标成「试验」，发完要看眼镜屏幕有没有反应，别当成已证实的结论。
+    static func command(cmd: Int, sessionId: [UInt8], commandId: String,
+                        source: Int = 0) -> [UInt8] {
+        var c: [UInt8] = []
+        c += PbW.int(1, cmd)
+        c += PbW.int(2, source)
+
+        var body: [UInt8] = []
+        body += PbW.int(1, SagenoteMsg.command.rawValue)
+        body += PbW.string(2, commandId)
+        body += PbW.bytes(3, sessionId)
+        body += PbW.int(4, Int(Date().timeIntervalSince1970 * 1000))
+        body += PbW.bytes(10, c)
+        return wrap(body)
+    }
+
+    /// 把 Sagenote 塞进 `Message{ f2=43, f46=... }`。    /// 手机发出的帧不带 `08 01` 版本前缀（官方 95 条发送样本里都没有）。
     /// 对照真实抓包 `aa55006200020000030100e6 102b f202 9902 ...`：
     /// 顶层就是 `10 2b | f2 02 <len> | <sagenote>`。
     static func wrap(_ sagenote: [UInt8]) -> [UInt8] {

@@ -1,6 +1,7 @@
 import Foundation
 import CoreBluetooth
 import UIKit
+import os
 
 /// GO3 眼镜的 GATT 坐标。
 /// 这些值不是猜的，是从安卓官方 App 的 smali 里挖出来、再用 bleak 实测验证过的，
@@ -107,6 +108,31 @@ final class GO3Central: NSObject, ObservableObject {
     private var audioWindowStart = Date()
     private var audioWindowFrames = 0
     private var lastAudioLog = Date.distantPast
+    /// 本连接内是否已经留过首帧原文。一帧就够，多了刷屏。
+    private var audioFirstFrameLogged = false
+
+    /// 把 `AUDIO` 内层的 `AudioConfig{ f1=采样率, f2=声道, f3=码率, f4=型号 }` 读成人话。
+    /// f4 的取值对照 `AudioModelTypeProto`：12 = AUDIO_SAGENOTE_MEETING。
+    private func audioConfigText(_ inner: [UInt8]) -> String {
+        let f = Pb.parse(inner)
+        guard let cfgField = Pb.first(f, 1), cfgField.wire == 2 else {
+            return "（没有 f1 AudioConfig，字段号：\(f.map { "f\($0.number)" }.joined(separator: ","))）"
+        }
+        let c = Pb.parse(cfgField.bytes)
+        let rate = Pb.first(c, 1)?.asInt ?? -1
+        let ch = Pb.first(c, 2)?.asInt ?? -1
+        let br = Pb.first(c, 3)?.asInt ?? -1
+        let model = Pb.first(c, 4)?.asInt ?? -1
+        let modelName: String
+        switch model {
+        case 12: modelName = "12=会记(AUDIO_SAGENOTE_MEETING)"
+        default: modelName = "\(model)"
+        }
+        return "AudioConfig 采样率=\(rate) 声道=\(ch) 码率=\(br) 型号=\(modelName)"
+    }
+
+    /// 最近一次收到的会记 session id。用来在「眼镜没让我们开录」时也能给它下发 STOP 收尾。
+    @Published private(set) var lastSessionId: [UInt8] = []
 
     /// 最近一条会记消息的摘要，给界面看。
     @Published private(set) var lastSagenote = "（还没收到会记消息）"
@@ -139,6 +165,9 @@ final class GO3Central: NSObject, ObservableObject {
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
+        // 日志实时通道：先起来，之后每行 append 都会顺手推出去。
+        // 电脑端：pymobiledevice3 usbmux forward 8787 8787 → nc 127.0.0.1 8787
+        LogServer.shared.start()
     }
 
     var stateText: String {
@@ -161,12 +190,67 @@ final class GO3Central: NSObject, ObservableObject {
         return f
     }()
 
+    /// 日志同时落盘，目的只有一个：**不用手抄**。
+    /// 沙盒 Documents 在打开 `UIFileSharingEnabled` 之后，电脑端可以用
+    /// `pymobiledevice3 afc pull` 直接把文件拉走；Files App 里也能看到并分享。
+    static let logFileName = "go3bridge.log"
+
+    static var logFileURL: URL {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return dir.appendingPathComponent(logFileName)
+    }
+
+    private static let osLog = OSLog(subsystem: "com.go3bridge.app", category: "bridge")
+    private static let fileQueue = DispatchQueue(label: "go3.logfile", qos: .utility)
+
+    private static func writeToFile(_ line: String) {
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        fileQueue.async {
+            let url = logFileURL
+            if let h = try? FileHandle(forWritingTo: url) {
+                defer { try? h.close() }
+                _ = try? h.seekToEnd()
+                try? h.write(contentsOf: data)
+            } else {
+                // 首次：带上启动时间，方便判断这份日志是哪一次的
+                let head = "# GO3Bridge log started \(Date())\n"
+                try? (head.data(using: .utf8)! + data).write(to: url)
+            }
+        }
+    }
+
+    /// 清空磁盘日志（新一轮排查前点一下，免得和上一场混在一起）
+    func clearLogFile() {
+        try? FileManager.default.removeItem(at: GO3Central.logFileURL)
+        append("已清空磁盘日志文件（后续只记新的）")
+    }
+
+    /// 把当前内存里的日志整段写到磁盘并返回文件 URL，给界面上的「分享」用。
+    func exportLog() -> URL? {
+        let text = log.joined(separator: "\n") + "\n"
+        let url = GO3Central.logFileURL
+        do {
+            try text.data(using: .utf8)?.write(to: url)
+            append("已写出日志文件：\(url.lastPathComponent)（\(log.count) 行）")
+            return url
+        } catch {
+            append("写日志文件失败：\(error.localizedDescription)")
+            return nil
+        }
+    }
+
     private func append(_ s: String) {
         let line = GO3Central.stamp.string(from: Date()) + "  " + s
         print(line)
+        // 换掉裸 print：print 只进 stdout，侧载的发行版在设备上等于丢进黑洞。
+        // os_log 才能被 syslog / Console 抓到（这是"实时看日志"的另一条通路）。
+        os_log("%{public}@", log: GO3Central.osLog, type: .default, line)
+        GO3Central.writeToFile(line)
+        LogServer.shared.broadcast(line)
         log.append(line)
-        if log.count > 500 {
-            log.removeFirst(log.count - 500)
+        // 原来 500 行，一轮 21 步握手的 hex 就能把前面的现场全挤掉。
+        if log.count > 4000 {
+            log.removeFirst(log.count - 4000)
         }
     }
 
@@ -218,6 +302,14 @@ final class GO3Central: NSObject, ObservableObject {
     func copyLog() {
         UIPasteboard.general.string = log.joined(separator: "\n")
         append("已把 \(log.count) 行日志复制到剪贴板")
+    }
+
+    /// 清空内存日志 + 磁盘日志。"新一轮排查前点一下"，
+    /// 否则上一场的 AUDIO/STATE 残留会把这一场的现象带偏（22:47 那场就吃这个亏）。
+    func clearLog() {
+        log.removeAll()
+        try? FileManager.default.removeItem(at: GO3Central.logFileURL)
+        append("日志已清空（内存 + 磁盘）")
     }
 
     // MARK: - 发送初始化（P3 核心）
@@ -339,6 +431,7 @@ final class GO3Central: NSObject, ObservableObject {
     /// 不回，眼镜就一直在等，屏幕上那个计时不会动。
     private func handleSagenote(_ s: SagenoteIn) {
         lastSagenote = s.summary
+        if !s.sessionId.isEmpty { lastSessionId = s.sessionId }
         append("  ◆ \(s.summary)")
 
         guard s.msgType == SagenoteMsg.command.rawValue, let cmd = s.cmd else { return }
@@ -362,6 +455,28 @@ final class GO3Central: NSObject, ObservableObject {
                                              cmd: cmd, ok: true)
         append("  → 回 COMMAND_ACK：cmd=\(cmd)(\(SagenoteCmd(rawValue: cmd)?.name ?? "?")) ok=1 session=\(s.sessionIdStr)")
         sendPayload(payload, ch: ch, label: "SAGENOTE COMMAND_ACK")
+    }
+
+    /// 手机主动下发会记命令（试验性）。
+    ///
+    /// 用途：给上一场没收尾的会话补一刀 STOP，或者试着自己开一场。
+    /// 22:47 那场就是因为上一场没停、眼镜连着旧会话，
+    /// 一进会记就显示 23 分钟（会话 id 里的毫秒戳 = 22:24:22）。
+    func sendSagenoteCommand(_ cmd: SagenoteCmd) {
+        guard let ch = targetChannel else {
+            append("还没连上眼镜，命令发不出去")
+            return
+        }
+        let sid = activeSessionId.isEmpty ? lastSessionId : activeSessionId
+        guard !sid.isEmpty else {
+            append("没有会话 id。先在眼镜上打开一次「会记」，让眼镜把 session 报上来，再发命令。")
+            return
+        }
+        let cid = "p\(Int(Date().timeIntervalSince1970 * 1000))"
+        let payload = SagenoteOut.command(cmd: cmd.rawValue, sessionId: sid, commandId: cid)
+        append("  → 下发会记命令 \(cmd.name)（session=\(String(decoding: sid, as: UTF8.self))，commandId=\(cid)）")
+        append("     ※ 这条是按 ACK 结构推定的，官方发送样本里没有 COMMAND，看眼镜屏幕反应")
+        sendPayload(payload, ch: ch, label: "SAGENOTE COMMAND \(cmd.name)")
     }
 
     private func applyCommandEffect(_ cmd: Int, sessionId: [UInt8]) {
@@ -442,15 +557,19 @@ final class GO3Central: NSObject, ObservableObject {
         }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-        guard !activeSessionId.isEmpty else {
-            append("还没有活动的会记会话（没收到 START/RESUME 命令）。先在眼镜上打开会记，等日志出现 ⏱。")
+        // 会话 id 优先用活动会话；没有就退回"眼镜最近报上来的那个"。
+        // 22:47 那场因为没收到 START，activeSessionId 一直是空，
+        // 注入按钮直接报"还没有活动的会记会话"，连通道都没法验。
+        let sid = activeSessionId.isEmpty ? lastSessionId : activeSessionId
+        guard !sid.isEmpty else {
+            append("还没有会话 id。先在眼镜上打开一次「会记」，让眼镜把 session 报上来。")
             return
         }
         asrSegmentId += 1
         let now = Int(Date().timeIntervalSince1970 * 1000)
         let begin = now - sessionStartMs()
 
-        let payload = SagenoteOut.asr(sessionId: activeSessionId, text: t,
+        let payload = SagenoteOut.asr(sessionId: sid, text: t,
                                       segmentId: asrSegmentId,
                                       beginMs: begin, endMs: now)
         append("  → 注入识别结果：「\(t)」")
@@ -917,6 +1036,7 @@ extension GO3Central: CBCentralManagerDelegate {
         audioWindowFrames = 0
         audioWindowStart = Date()
         lastAudioLog = Date.distantPast
+        audioFirstFrameLogged = false
         lastAckedCommandId = []
         lastSagenote = "（还没收到会记消息）"
         append("已连接 \(connectedName ?? "")，开始枚举服务")
@@ -1040,13 +1160,29 @@ extension GO3Central: CBPeripheralDelegate {
             // ① 音频帧：一秒十几帧，绝不能逐帧打日志。只计数 + 每秒一行汇总。
             //    22:24 的日志里 248 帧有 235 帧是这个，等于眼镜一直在把麦克风数据推给我们。
             if env.msgType == 0 {
+                // 首帧单独留一份原文：AudioConfig 里的采样率/声道/码率/型号只能这样确认。
+                // 22:47 那场一帧音频都没有，光看计数"是 0"说明不了是没采到还是没记到。
+                if !audioFirstFrameLogged {
+                    audioFirstFrameLogged = true
+                    append("  ♪ 首帧音频 \(env.inner.count)B  \(audioConfigText(env.inner))")
+                    append("       \(hex(Data(f.payload)))")
+                }
                 noteAudioFrame(bytes: env.inner.count)
                 return
             }
 
             // ② 会记：解成人话，并对 COMMAND 回 ACK（这是官方唯一要求的应答）。
-            if env.msgType == 43, let s = SagenoteIn.decode(f.payload) {
-                handleSagenote(s)
+            //    注意这里**要把原文也打出来**：22:47 那场只打了人话，导致事后无法
+            //    核对眼镜到底发了哪几个字段（出现过 typeName 显示"未知(10)"却查不下去）。
+            if env.msgType == 43 {
+                if let s = SagenoteIn.decode(f.payload) {
+                    append("  ← \(short(characteristic.uuid))  \(f.summary)")
+                    append("       \(hex(d))")
+                    handleSagenote(s)
+                } else {
+                    append("  ← \(short(characteristic.uuid))  会记帧解不出（f46 缺失或截断）")
+                    append("       \(hex(d))")
+                }
                 return
             }
 

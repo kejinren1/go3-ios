@@ -342,3 +342,71 @@ da 01 0f                         f27 = BleConnectBind
 `Opus 解码 + 云端 ASR`。iOS 没有公开的 Opus 解码 API，可选：
 ① CI 里编一份 libopus 静态库塞进 App；② 把裸 Opus 包转发到电脑/服务端解码再回传。
 两条都要真实 ASR 账号（讯飞/火山/阿里）才出文字。
+
+---
+
+## 八、日志怎么取（不用再手抄）
+
+以前的做法是：App 里一个 `TextEditor`，用户手抹选文字 → 粘到 docx → 发过来。
+一份 500 行的日志要来回好几趟，而且 `TextEditor` 里选中长文本本身就会漏行。
+P12 起有三条路，按"省事程度"从上到下：
+
+### 1. App 内直接导出（零依赖，最先用这个）
+
+右上角菜单 →「导出为文件并分享」→ 存到「文件」App / AirDrop / 发给微信。
+落到沙盒 `Documents/go3bridge.log`，同时弹系统分享面板。
+
+`project.yml` 里已经打开：
+```yaml
+UIFileSharingEnabled: true
+LSSupportsOpeningDocumentsInPlace: true
+```
+所以这个文件在「文件」App 的「我的 iPhone → GO3 Bridge」里也直接可见。
+
+### 2. 电脑直接拉文件（不做任何操作，适合"事后取证"）
+
+```bash
+pip install pymobiledevice3
+python -m pymobiledevice3 apps pull --documents com.go3bridge.app ./
+```
+不需要 Info.plist 开文件共享也能拉（走 house_arrest），所以这条路对**旧包也有效**。
+代价是只能拿到"已经写进文件的部分"，看不到实时滚动。
+
+### 3. 实时推送（边操作边看，最优）
+
+App 里 `LogServer` 在 8787 上监听；电脑用 usbmux 把它映射出来：
+
+```bash
+python tools/tail-log.py          # 一条命令搞定，内部自己起转发再连接
+```
+
+等价的手工版本：
+```bash
+python -m pymobiledevice3 usbmux forward 8787 8787
+# 另开一个窗口
+nc 127.0.0.1 8787
+```
+
+**为什么走 usbmux 而不是 WiFi**：用眼镜时手机常常连着 `INMO GO3 42D3` 热点，
+这时电脑和手机根本不在一个网段，WiFi 直连必失败。usbmux 走数据线，与网络拓扑无关。
+连上会先补发最近 300 行，所以"先出事、后开电脑"也不会丢现场。
+
+### 为什么还要 `os_log`
+
+`append()` 原来是裸 `print()` —— 在侧载的发行版里 stdout 直接进黑洞，
+`Console.app` / `syslog` 一个字都看不到。现在同时走 `os_log`
+（`subsystem=com.go3bridge.app, category=bridge`，全部 `%{public}@`），
+所以数据线插着时 `python -m pymobiledevice3 syslog` 也能看到一份。
+
+### 顺手修的两个坑
+
+- **日志上限 500 行 → 4000 行**。一轮 21 步握手的 hex 就能把前面的现场全挤掉，
+  22:47 那份日志里"眼镜刚连上时发了什么"就是这么丢的。
+- **界面只渲染最后 300 行**。`ForEach` 铺上千行会卡，而排查要看的信息都在尾部。
+
+### 会记帧现在会打原文
+
+以前 `handleSagenote` 只打人话（`◆ 会记 ...`）就 `return`，原文 hex 没了。
+22:47 那场出现 `typeName=未知(10)` 时就没法回头核对到底发了哪几个字段。
+现在会记帧也打 hex；音频则**只留首帧**（含 `AudioConfig` 解析：采样率/声道/码率/型号），
+其余仍然只计数——一秒十几帧全打会把有用的东西冲走。

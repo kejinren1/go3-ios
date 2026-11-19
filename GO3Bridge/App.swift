@@ -11,9 +11,26 @@ struct GO3BridgeApp: App {
     }
 }
 
+/// 分享面板要一个 Identifiable 的载体，URL 本身不是。
+struct ShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+/// 把系统的「分享」面板包一层：可以直接 AirDrop / 存到「文件」/ 发微信，
+/// 比在 TextEditor 里抹选文字再粘贴快得多。
+struct ActivityView: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+}
+
 struct RootView: View {
     @StateObject private var ble = GO3Central()
     @State private var asrText = ""
+    @State private var shareItem: ShareItem?
 
     var body: some View {
         NavigationStack {
@@ -33,8 +50,18 @@ struct RootView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button("复制日志") { ble.copyLog() }
-                        .disabled(ble.log.isEmpty)
+                    // 三个动作合成一个菜单：手抄、分享、清场。
+                    // 「导出文件」是最省事的——存到「文件」或直接发给电脑，不用选文字。
+                    Menu {
+                        Button("复制全部日志") { ble.copyLog() }
+                        Button("导出为文件并分享") {
+                            if let u = ble.exportLog() { shareItem = ShareItem(url: u) }
+                        }
+                        Button("清空日志", role: .destructive) { ble.clearLog() }
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .disabled(ble.log.isEmpty)
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(ble.scanning ? "停止" : "扫描") {
@@ -46,6 +73,9 @@ struct RootView: View {
                     }
                     .disabled(!ble.scanning && ble.managerState != .poweredOn)
                 }
+            }
+            .sheet(item: $shareItem) { item in
+                ActivityView(items: [item.url])
             }
         }
     }
@@ -193,6 +223,30 @@ struct RootView: View {
 
             Divider()
 
+            // 上一场没收尾，眼镜会连着旧会话：一进会记就显示"已经开了 23 分钟"。
+            // 这两个按钮就是给这种情况准备的手动闸门。
+            VStack(alignment: .leading, spacing: 6) {
+                Text("会记命令（试验性）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button("STOP 收尾旧场") { ble.sendSagenoteCommand(.stop) }
+                        .buttonStyle(.bordered)
+                        .font(.subheadline)
+                    Button("START 新建一场") { ble.sendSagenoteCommand(.start) }
+                        .buttonStyle(.borderedProminent)
+                        .font(.subheadline)
+                    Spacer()
+                }
+                Text(ble.lastSessionId.isEmpty
+                     ? "还没有会话 id：先在眼镜上打开一次「会记」，让眼镜把 session 报上来。"
+                     : "当前 session：\(String(decoding: ble.lastSessionId, as: UTF8.self))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
             // 眼镜屏幕上的计时靠手机每秒发一条 SAGENOTE_STATE 推进。
             // 官方抓包里序号是 01→02→03 递增的，我们照做。
             HStack(spacing: 8) {
@@ -221,7 +275,7 @@ struct RootView: View {
                 .font(.subheadline)
                 .disabled(asrText.trimmingCharacters(in: .whitespaces).isEmpty)
             }
-            .disabled(!ble.tickerRunning)
+            .disabled(ble.lastSessionId.isEmpty)
 
             Text("这句话会以「识别结果」的身份发给眼镜。屏幕上出现了它 = 回传通道通了；没出现 = 协议字段还有问题。")
                 .font(.caption2)
@@ -532,8 +586,19 @@ struct RootView: View {
                     .foregroundStyle(.secondary)
             }
 
+            // 实时通道状态。电脑侧一行命令就能看到：
+            //   pymobiledevice3 usbmux forward 8787 8787  然后  nc 127.0.0.1 8787
+            Text("实时推送：\(LogServer.shared.statusText)  ·  端口 \(LogServer.port)")
+                .font(.caption2)
+                .foregroundStyle(LogServer.shared.liveConnections > 0 ? .green : .secondary)
+            Text("磁盘：Documents/\(GO3Central.logFileName)（关掉 App 也还在，电脑可用 pymobiledevice3 apps pull 拉走）")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
             VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(ble.log.enumerated()), id: \.offset) { pair in
+                // 只渲染最后 300 行：一次性 ForEach 上千行会把界面拖卡，
+                // 而排查要看的信息都在尾部。
+                ForEach(Array(ble.log.suffix(300).enumerated()), id: \.offset) { pair in
                     Text(pair.element)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.primary)
