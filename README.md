@@ -290,3 +290,55 @@ da 01 0f                         f27 = BleConnectBind
 绑定 + 握手能解决「认不认你」，但「会记听不听、提词转不转圈」还取决于
 手机侧有没有提供 ASR / 云端能力。我们的 App 目前只有协议层，
 没有音频接收和云端识别 —— 这是下一步要做的事，不是配置问题。
+
+---
+
+## 七、会记（SAGENOTE）：一条完整闭环
+
+2026-11-19 的日志把问题定死了：**版本号修好后，眼镜打开会记会用 `AUDIO(0)` 持续把
+麦克风数据推上来**（248 帧里 235 帧是音频，约 18 帧/秒、每帧 ~185B，16 kHz / 32 kbps），
+而我们一条都没回。所以症状不是"眼镜不工作"，是"手机侧没接"。
+
+### 消息地图（`MessageTypeProto` 原文）
+
+| msgType | 名字 | 内外层 |
+|---|---|---|
+| 0 | AUDIO | f3 = `{f1=AudioConfig{sampleRate, ch, bitrate, model}, f3=len, f4=opus}` |
+| 43 | SAGENOTE | f46 = `Sagenote` |
+
+`Sagenote`（`SagenoteProto.java`）字段：1 类型 / 2 command_id / 3 session_id /
+4 时间戳 / 10 command / 11 command_ack / 12 query / 13 state / 14 asr /
+15 translation / 16 summary / 17 config / 18 panel / 19 marker / 21 语言表 / 22 tab_view / 23 backup
+
+`SagenoteMessageType`：0 COMMAND / 1 COMMAND_ACK / 2 QUERY / 3 STATE / 4 ASR /
+5 TRANSLATION / 6 SUMMARY / 7 CONFIG / 8 PANEL / 9 MARKER / 11 LANGUAGE_LIST /
+12 TAB_VIEW / 13 BACKUP
+
+### 闭环长什么样（官方抓包 `INTEL/sniff.log` 手机→眼镜方向，逐字节核对过）
+
+| 步 | 帧 | 关键字节 |
+|---|---|---|
+| 1 | 语言表 / 配置 | `10 2b f2 02 <len> 08 0b …`（281 字节，要分包） |
+| 2 | 命令回执 | `08 01 … 5a 18 08 02 10 01 2a 12 <session>` |
+| 3 | **每秒状态心跳** | `08 03 … 6a 0a 08 01 10 01 18 <seq> 20 02 2a 00` |
+| 4 | 识别结果 | `08 04 … 72 1e 10 01 1a 1a 08 01 12 03 <文字> 20 02 2a 09 <说话人> 30 <begin> 38 <end>` |
+| 5 | 音频备份 | `08 0d …` |
+
+**「不计时」就是这个第 3 步**：眼镜屏幕上的时长靠手机每秒发一条 `SAGENOTE_STATE` 推进，
+`18 <seq>` 那个数是逐秒递增的（抓包里 01→02→04→05…→1a）。我们从来不发，屏幕就一直是 00:00。
+
+**「不识别文字」是第 4 步**：得先解 Opus 再调云端 ASR。目前没做，
+所以界面上给了一个「手动注入一句识别结果」的框 —— 用来**单独验证回传通道**。
+通道和识别是两个问题，别混着查。
+
+### 现在能自己验证什么
+
+1. 眼镜上打开会记 → 界面「音频帧」开始涨 = 采音在跑、链路是通的
+2. 日志出现 `⏱ 开始每秒状态心跳` → 看眼镜屏幕上的计时是否开始走
+3. 手动注入一句「测试一二三」→ 眼镜屏幕上出现了 = 回传通道没问题，只差识别
+
+### 还没做的
+
+`Opus 解码 + 云端 ASR`。iOS 没有公开的 Opus 解码 API，可选：
+① CI 里编一份 libopus 静态库塞进 App；② 把裸 Opus 包转发到电脑/服务端解码再回传。
+两条都要真实 ASR 账号（讯飞/火山/阿里）才出文字。
