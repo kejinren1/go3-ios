@@ -26,6 +26,28 @@ struct BleDevice: Identifiable {
 /// P1 阶段的目标只有一个：**能不能连上、GATT 表跟安卓那边是不是同一张**。
 /// 所以这里只做「扫描 → 连接 → 枚举 → 读一次 2021 → 订阅通知」，
 /// 一个字节都不写。写错了可能把眼镜的对话状态机搞成半开（安卓那边踩过）。
+/// `Message` 信封的拆解结果。
+///
+/// 铁律是 `Message{ f1=version, f2=msgType, f<msgType+3>=内层 }`，
+/// 但**实测眼镜发来的帧经常没有 f2**（会记的 f46、绑定的 f27、音频的 f3 都没有）。
+/// 所以这里不靠 f2 判断，直接取第一个 length-delimited 字段，用「字段号 − 3」反推 msgType：
+///   f3 → AUDIO(0) · f14 → AI_ASSISTANT(11) · f27 → BLE_CONNECT_BIND(24) · f46 → SAGENOTE(43)
+/// 这四种都跟 `MessageTypeProto` 对得上，也跟真实抓包一致。
+struct GO3Envelope {
+    let msgType: Int
+    let inner: [UInt8]
+
+    static func decode(_ payload: [UInt8]) -> GO3Envelope {
+        let fields = Pb.parse(payload)
+        // f2 存在时优先信它（和字段号互校过，见上面注释）
+        let f2 = Pb.first(fields, 2).flatMap { $0.wire == 0 ? $0.asInt : nil }
+        guard let body = fields.first(where: { $0.wire == 2 }) else {
+            return GO3Envelope(msgType: f2 ?? -1, inner: [])
+        }
+        return GO3Envelope(msgType: f2 ?? (body.number - 3), inner: body.bytes)
+    }
+}
+
 final class GO3Central: NSObject, ObservableObject {
 
     @Published private(set) var managerState: CBManagerState = .unknown
@@ -72,6 +94,26 @@ final class GO3Central: NSObject, ObservableObject {
     /// 长按 GO 键说了话之后如果这个数不涨，就是它根本没把 ASR 发出来，
     /// 而不是我们没解析。
     @Published private(set) var rxCount = 0
+
+    // MARK: - 音频流统计（会记/翻译的语音都走这条）
+
+    /// 眼镜把麦克风数据用 Opus 编好、按 `AUDIO(0)` 往上推。
+    /// 22:24 那份日志里 248 帧中有 235 帧是音频：约 18 帧/秒、每帧 ~185B，
+    /// 对应 16 kHz / 32 kbps。**它一直在送，是我们这边没接。**
+    @Published private(set) var audioFrames = 0
+    @Published private(set) var audioBytes = 0
+    @Published private(set) var audioFPS: Double = 0
+
+    private var audioWindowStart = Date()
+    private var audioWindowFrames = 0
+    private var lastAudioLog = Date.distantPast
+
+    /// 最近一条会记消息的摘要，给界面看。
+    @Published private(set) var lastSagenote = "（还没收到会记消息）"
+
+    /// 已经回过 ACK 的 commandId。官方也有去重（`sagenoteCommandDedupKey`），
+    /// 眼镜每秒会重发同一条命令，不挡就会把 ACK 刷成洪水。
+    private var lastAckedCommandId: [UInt8] = []
 
     /// 一键流程用：全量初始化发完后自动补一枪亮度自检。
     /// 顺序很关键——绑定之前发命令，眼镜是直接丢的（用户 22:25 实测印证：
@@ -187,6 +229,8 @@ final class GO3Central: NSObject, ObservableObject {
         let data: Data
         let ch: CBCharacteristic
         let label: String
+        /// 心跳类高频帧不打逐条日志，否则一秒一行把有用的信息全冲走。
+        var quiet: Bool = false
     }
 
     private var queue: [PendingWrite] = []
@@ -201,8 +245,8 @@ final class GO3Central: NSObject, ObservableObject {
 
     /// 排队一次写。分包已经在 `sendPayload` 里按协议做完了，这里不再切字节——
     /// 把一条逻辑帧随便切片会破坏它自己的长度字段和 CRC。
-    private func enqueue(_ data: Data, ch: CBCharacteristic, label: String) {
-        queue.append(PendingWrite(data: data, ch: ch, label: label))
+    private func enqueue(_ data: Data, ch: CBCharacteristic, label: String, quiet: Bool = false) {
+        queue.append(PendingWrite(data: data, ch: ch, label: label, quiet: quiet))
         pump()
     }
 
@@ -217,7 +261,8 @@ final class GO3Central: NSObject, ObservableObject {
     }
 
     /// 把一条 protobuf 消息发出去：按 MTU 算单包 payload 上限，切成 1..N 个包。
-    private func sendPayload(_ payload: [UInt8], ch: CBCharacteristic, label: String) {
+    private func sendPayload(_ payload: [UInt8], ch: CBCharacteristic, label: String,
+                             quiet: Bool = false) {
         // 单包上限强制卡到 230B（总长 244B）——这是官方 App 的实际上限
         // （Android MTU 247 − 3 = 244）。iOS 报 509B，但 281B 那种一次写进去
         // 直接把连接写断了（22:31 实测："The connection has timed out unexpectedly"）。
@@ -227,7 +272,7 @@ final class GO3Central: NSObject, ObservableObject {
         let parts = GO3Frame.packets(seq: seq, payload: payload, maxPayload: perPacket)
         for (i, pkt) in parts.enumerated() {
             let tag = parts.count > 1 ? "\(label) 包\(i + 1)/\(parts.count)" : label
-            enqueue(pkt, ch: ch, label: "\(tag) seq=\(seq) \(payload.count)B")
+            enqueue(pkt, ch: ch, label: "\(tag) seq=\(seq) \(payload.count)B", quiet: quiet)
         }
     }
 
@@ -262,6 +307,158 @@ final class GO3Central: NSObject, ObservableObject {
             guard let self = self else { return }
             self.append("  ▸ 命令发出后 3 秒：新收到 \(self.rxCount - before) 帧")
         }
+    }
+
+    // MARK: - 音频流与会记（会记到底卡在哪）
+
+    /// 音频帧不进逐帧日志 —— 一秒十几帧，会把有用的东西全冲走。
+    /// 只更新计数，并每秒最多打一行汇总。
+    private func noteAudioFrame(bytes: Int) {
+        audioFrames += 1
+        audioBytes += bytes
+        audioWindowFrames += 1
+
+        let now = Date()
+        let dt = now.timeIntervalSince(audioWindowStart)
+        guard dt >= 1.0 else { return }
+        audioFPS = Double(audioWindowFrames) / dt
+        audioWindowFrames = 0
+        audioWindowStart = now
+
+        if now.timeIntervalSince(lastAudioLog) >= 1.0 {
+            lastAudioLog = now
+            append(String(format: "  ♪ 音频累计 %d 帧 · %.1f KB · %.0f 帧/秒（眼镜在采音，等我们解码）",
+                          audioFrames, Double(audioBytes) / 1024.0, audioFPS))
+        }
+    }
+
+    /// 处理一条会记消息。
+    ///
+    /// 最要紧的一步：眼镜发来 `SAGENOTE_COMMAND` 后**必须回 `COMMAND_ACK`**。
+    /// 官方 `SagenoteProbufProcessManager.sendAck()` 就是逐字这么构造的。
+    /// 不回，眼镜就一直在等，屏幕上那个计时不会动。
+    private func handleSagenote(_ s: SagenoteIn) {
+        lastSagenote = s.summary
+        append("  ◆ \(s.summary)")
+
+        guard s.msgType == SagenoteMsg.command.rawValue, let cmd = s.cmd else { return }
+
+        // 先按命令切换「每秒心跳」的开关，再管 ACK。
+        // 顺序有讲究：眼镜重发同一条命令时 ACK 会被去重挡掉，但心跳不能因此漏开。
+        applyCommandEffect(cmd, sessionId: s.sessionId)
+
+        if s.commandId == lastAckedCommandId {
+            append("     （同一 commandId 已回过 ACK，按官方做法去重）")
+            return
+        }
+        guard let ch = targetChannel else {
+            append("     （还没连上，ACK 发不出去）")
+            return
+        }
+
+        lastAckedCommandId = s.commandId
+        let payload = SagenoteOut.commandAck(commandId: s.commandId,
+                                             sessionId: s.sessionId,
+                                             cmd: cmd, ok: true)
+        append("  → 回 COMMAND_ACK：cmd=\(cmd)(\(SagenoteCmd(rawValue: cmd)?.name ?? "?")) ok=1 session=\(s.sessionIdStr)")
+        sendPayload(payload, ch: ch, label: "SAGENOTE COMMAND_ACK")
+    }
+
+    private func applyCommandEffect(_ cmd: Int, sessionId: [UInt8]) {
+        switch SagenoteCmd(rawValue: cmd) {
+        case .start, .notifyStarted, .resume:
+            startStateTicker(sessionId: sessionId)
+        case .stop, .notifyStopped, .pause:
+            stopStateTicker()
+        default:
+            break
+        }
+    }
+
+    // MARK: - 每秒状态心跳（眼镜屏幕上的计时就是它驱动的）
+
+    @Published private(set) var stateTicks = 0
+    @Published private(set) var tickerRunning = false
+
+    private var stateTimer: Timer?
+    private var stateSeq = 0
+    private var activeSessionId: [UInt8] = []
+
+    /// 官方抓包里手机每秒发一条 `SAGENOTE_STATE`，序号递增（01→02→03…）。
+    /// 停掉它就等于告诉眼镜"采集停了"，屏幕上的时长会停住。
+    func startStateTicker(sessionId: [UInt8]) {
+        if tickerRunning, sessionId == activeSessionId { return }
+        stopStateTicker()
+
+        activeSessionId = sessionId
+        stateSeq = 0
+        stateTicks = 0
+        sessionStart = Date()
+        tickerRunning = true
+        append("  ⏱ 开始每秒状态心跳（session=\(String(decoding: sessionId, as: UTF8.self))）—— 眼镜屏幕上的计时靠它推进")
+
+        let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        stateTimer = t
+        tick()   // 立刻发第一条，别让屏幕空等 1 秒
+    }
+
+    func stopStateTicker() {
+        stateTimer?.invalidate()
+        stateTimer = nil
+        if tickerRunning {
+            append("  ⏱ 停止状态心跳（共 \(stateTicks) 条）")
+        }
+        tickerRunning = false
+    }
+
+    private func tick() {
+        guard let ch = targetChannel else { return }
+        stateSeq += 1
+        stateTicks += 1
+        let payload = SagenoteOut.state(sessionId: activeSessionId, seq: stateSeq)
+        // 每秒一条，全打日志会刷屏：前 3 条留痕，之后静默，靠界面上的计数看。
+        if stateTicks <= 3 {
+            append("  ⏱ 状态 #\(stateSeq)")
+        }
+        sendPayload(payload, ch: ch, label: "SAGENOTE STATE #\(stateSeq)",
+                    quiet: stateTicks > 3)
+    }
+
+    // MARK: - 手动注入识别结果（验证回传通道用）
+
+    private var asrSegmentId = 0
+    private var sessionStart = Date()
+
+    /// 把一段文字当成 ASR 结果发给眼镜。
+    /// 用途：此刻我们还没有真正的语音识别，但可以先验证"手机→眼镜的文字回传通道"通不通。
+    /// 眼镜屏幕上出现了这段字，就说明缺的只剩识别本身，而不是协议。
+    func injectAsr(_ text: String) {
+        guard let ch = targetChannel else {
+            append("还没连上眼镜，先连接")
+            return
+        }
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        guard !activeSessionId.isEmpty else {
+            append("还没有活动的会记会话（没收到 START/RESUME 命令）。先在眼镜上打开会记，等日志出现 ⏱。")
+            return
+        }
+        asrSegmentId += 1
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        let begin = now - sessionStartMs()
+
+        let payload = SagenoteOut.asr(sessionId: activeSessionId, text: t,
+                                      segmentId: asrSegmentId,
+                                      beginMs: begin, endMs: now)
+        append("  → 注入识别结果：「\(t)」")
+        sendPayload(payload, ch: ch, label: "SAGENOTE ASR")
+    }
+
+    private func sessionStartMs() -> Int {
+        Int(Date().timeIntervalSince(sessionStart) * 1000)
     }
 
     // MARK: - 定时断开（调试用）
@@ -521,11 +718,13 @@ final class GO3Central: NSObject, ObservableObject {
 
         queue.removeFirst()
         p.writeValue(item.data, for: item.ch, type: nr ? .withoutResponse : .withResponse)
-        append("→ \(short(item.ch.uuid))  \(item.data.count)B  \(item.label)")
-        if item.data.count <= 64 {
-            append("       \(hex(item.data))")
-        } else {
-            append("       \(hex(item.data.prefix(10)))…（共 \(item.data.count)B）")
+        if !item.quiet {
+            append("→ \(short(item.ch.uuid))  \(item.data.count)B  \(item.label)")
+            if item.data.count <= 64 {
+                append("       \(hex(item.data))")
+            } else {
+                append("       \(hex(item.data.prefix(10)))…（共 \(item.data.count)B）")
+            }
         }
 
         if nr {
@@ -712,6 +911,14 @@ extension GO3Central: CBCentralManagerDelegate {
         connectedName = peripheral.name ?? peripheral.identifier.uuidString
         experimentHintShown = false
         bindTries = 0
+        audioFrames = 0
+        audioBytes = 0
+        audioFPS = 0
+        audioWindowFrames = 0
+        audioWindowStart = Date()
+        lastAudioLog = Date.distantPast
+        lastAckedCommandId = []
+        lastSagenote = "（还没收到会记消息）"
         append("已连接 \(connectedName ?? "")，开始枚举服务")
         // 把包构造器和官方真实捕获的那条帧逐字节比一次。
         // 这行如果显示"不一致"，后面发什么都白费，先修构造器。
@@ -743,6 +950,9 @@ extension GO3Central: CBCentralManagerDelegate {
         stage = .idle
         bindTries = 0
         bindIsQuery = false
+        stopStateTicker()
+        activeSessionId = []
+        lastAckedCommandId = []
         releaseWork?.cancel()
         releaseWork = nil
         append("  连接已断。如果不是你手动断的，重点看断之前最后几帧眼镜发了什么。")
@@ -825,6 +1035,21 @@ extension GO3Central: CBPeripheralDelegate {
 
         // 能按 aa55 帧解出来就解，解不出来就老实打 hex —— 不猜。
         if let f = GO3Frame.parse(d) {
+            let env = GO3Envelope.decode(f.payload)
+
+            // ① 音频帧：一秒十几帧，绝不能逐帧打日志。只计数 + 每秒一行汇总。
+            //    22:24 的日志里 248 帧有 235 帧是这个，等于眼镜一直在把麦克风数据推给我们。
+            if env.msgType == 0 {
+                noteAudioFrame(bytes: env.inner.count)
+                return
+            }
+
+            // ② 会记：解成人话，并对 COMMAND 回 ACK（这是官方唯一要求的应答）。
+            if env.msgType == 43, let s = SagenoteIn.decode(f.payload) {
+                handleSagenote(s)
+                return
+            }
+
             var line = "  ← \(short(characteristic.uuid))  \(f.summary)"
             if let pb = f.pbBrief {
                 line += "  \(pb)"
@@ -832,9 +1057,13 @@ extension GO3Central: CBPeripheralDelegate {
             append(line)
             append("       \(hex(d))")
 
-            // 绑定消息单独解成人话，并驱动流程往下走。
+            // ③ 绑定消息单独解成人话，并驱动流程往下走。
             if let rep = BindReport.decode(f.payload) {
                 append("  ★ \(rep.summary)")
+                if rep.msgType == 6 {
+                    append("  ⚠ 眼镜发来 UNBIND（解绑请求）。我**没有**自动回 UNBIND_RESPONSE ——")
+                    append("     回了就等于确认解绑，绑定状态可能被清掉，这个要你决定。")
+                }
                 handleBindReport(rep)
             }
         } else {

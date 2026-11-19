@@ -13,12 +13,14 @@ struct GO3BridgeApp: App {
 
 struct RootView: View {
     @StateObject private var ble = GO3Central()
+    @State private var asrText = ""
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     statusCard
+                    audioSection
                     deviceSection
                     sessionSection
                     bindSection
@@ -136,6 +138,98 @@ struct RootView: View {
                 }
             }
         }
+    }
+
+    // MARK: - 音频 / 会记
+
+    /// 这一块是判断「会记到底卡在哪」的仪表盘。
+    /// 眼镜打开会记后会用 `AUDIO(0)` 往上狂推 Opus（实测约 18 帧/秒、16 kHz、32 kbps），
+    /// 同时发 `SAGENOTE(43)` 的命令和状态。音频帧数在涨 = 它确实在采音，
+    /// 那么「不识别文字」就一定是手机侧没做识别，而不是没收到声音。
+    private var audioSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("音频 / 会记")
+                .font(.headline)
+
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(ble.audioFrames)")
+                        .font(.title3.monospacedDigit())
+                    Text("音频帧")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(String(format: "%.1f KB", Double(ble.audioBytes) / 1024.0))
+                        .font(.title3.monospacedDigit())
+                    Text("累计")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(String(format: "%.0f", ble.audioFPS))
+                        .font(.title3.monospacedDigit())
+                    Text("帧/秒")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Text(ble.audioFrames > 0
+                 ? "眼镜在采音并推 Opus 上来。这些字节目前只统计不解码——要出文字得在手机侧加「Opus 解码 + 云端 ASR」。"
+                 : "还没收到音频。去眼镜菜单打开「会记」，这个数应该立刻开始涨。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            Text("最近一条会记消息")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(ble.lastSagenote)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Divider()
+
+            // 眼镜屏幕上的计时靠手机每秒发一条 SAGENOTE_STATE 推进。
+            // 官方抓包里序号是 01→02→03 递增的，我们照做。
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(ble.tickerRunning ? Color.green : Color.secondary.opacity(0.4))
+                    .frame(width: 8, height: 8)
+                Text(ble.tickerRunning
+                     ? "状态心跳：运行中，已发 \(ble.stateTicks) 条（眼镜的计时靠它）"
+                     : "状态心跳：未运行（等眼镜发 START/RESUME）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            // 还没有真正的语音识别，但通道可以先验：这段字如果出现在眼镜上，
+            // 说明缺的只剩「Opus 解码 + 云端 ASR」，协议层是通的。
+            HStack(spacing: 8) {
+                TextField("手动注入一句识别结果", text: $asrText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.subheadline)
+                    .autocorrectionDisabled()
+                Button("发送") {
+                    ble.injectAsr(asrText)
+                    asrText = ""
+                }
+                .buttonStyle(.borderedProminent)
+                .font(.subheadline)
+                .disabled(asrText.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .disabled(!ble.tickerRunning)
+
+            Text("这句话会以「识别结果」的身份发给眼镜。屏幕上出现了它 = 回传通道通了；没出现 = 协议字段还有问题。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     // MARK: - 连接保持
