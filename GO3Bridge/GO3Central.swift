@@ -434,6 +434,35 @@ final class GO3Central: NSObject, ObservableObject {
         if !s.sessionId.isEmpty { lastSessionId = s.sessionId }
         append("  ◆ \(s.summary)")
 
+        // 眼镜报「采集=ACTIVE」但我们这边没有 START/心跳 → 它在续上一场的老会话。
+        // 22:47 那场就是这么来的：屏幕上直接显示 23 分钟，而且一帧音频都不推
+        // （会话 id mt-1795127062381 换算本地时间 = 22:24:22，正是上一场的起点）。
+        if s.msgType == SagenoteMsg.state.rawValue,
+           s.captureState == SagenoteCapture.active.rawValue,
+           !tickerRunning {
+            append("  ⚠ 眼镜说自己在采集，但没发 START 给我们 —— 它在续旧会话。")
+            append("     现象会是：一进会记就显示一个很大的时长，且音频帧一直是 0。")
+            append("     先点上面「STOP 收尾旧场」，再在眼镜上重开一次会记。")
+        }
+
+        // 眼镜在问「你现在什么状态」——QUERY 就是干这个的，必须回一条 STATE。
+        // 22:48:06 眼镜一连问了两遍 QUERY，我们一句都没答，它就没法确认采集到底在不在进行。
+        if s.msgType == SagenoteMsg.query.rawValue, let ch = targetChannel {
+            let sid = !activeSessionId.isEmpty ? activeSessionId
+                    : (!s.sessionId.isEmpty ? s.sessionId : lastSessionId)
+            if !sid.isEmpty {
+                let elapsed = max(0, Int(Date().timeIntervalSince(sessionStart)))
+                let payload = SagenoteOut.state(sessionId: sid,
+                                                commandId: s.commandIdStr,
+                                                elapsedSeconds: elapsed,
+                                                capture: capturePaused ? .suspended : .active)
+                append("  → 回 QUERY：STATE elapsed=\(elapsed)s（回显 commandId=\(s.commandIdStr)）")
+                sendPayload(payload, ch: ch, label: "SAGENOTE STATE(答 QUERY)")
+            } else {
+                append("  ⚠ 眼镜问了 QUERY，但我们还没有 session id，没法答。")
+            }
+        }
+
         guard s.msgType == SagenoteMsg.command.rawValue, let cmd = s.cmd else { return }
 
         // 先按命令切换「每秒心跳」的开关，再管 ACK。
@@ -473,44 +502,96 @@ final class GO3Central: NSObject, ObservableObject {
             return
         }
         let cid = "p\(Int(Date().timeIntervalSince1970 * 1000))"
-        let payload = SagenoteOut.command(cmd: cmd.rawValue, sessionId: sid, commandId: cid)
-        append("  → 下发会记命令 \(cmd.name)（session=\(String(decoding: sid, as: UTF8.self))，commandId=\(cid)）")
-        append("     ※ 这条是按 ACK 结构推定的，官方发送样本里没有 COMMAND，看眼镜屏幕反应")
+        // START 要带起点：眼镜拿它当这一场的计时零点。
+        // 不带，它很可能继续沿用旧会话的起点 —— 那就是"从 23 分钟开始"的来源。
+        let startTs = cmd == .start ? Int(Date().timeIntervalSince1970 * 1000) : nil
+        let payload = SagenoteOut.command(cmd: cmd.rawValue, sessionId: sid,
+                                          commandId: cid, startTimestampMs: startTs)
+        append("  → 下发会记命令 \(cmd.name)（session=\(String(decoding: sid, as: UTF8.self))，commandId=\(cid)"
+               + (startTs != nil ? "，起点=现在" : "") + "）")
+        append("     ※ 结构按反编译字段推定，官方发送样本里没有 COMMAND，看眼镜屏幕反应")
         sendPayload(payload, ch: ch, label: "SAGENOTE COMMAND \(cmd.name)")
     }
 
     private func applyCommandEffect(_ cmd: Int, sessionId: [UInt8]) {
         switch SagenoteCmd(rawValue: cmd) {
-        case .start, .notifyStarted, .resume:
-            startStateTicker(sessionId: sessionId)
-        case .stop, .notifyStopped, .pause:
+        case .start:
+            // START 是真的"新开一场"：起点就是现在，别沿用 session id 里的旧时间。
+            startStateTicker(sessionId: sessionId, fromStart: false)
+        case .notifyStarted:
+            // 眼镜说"已经开始了"，此时 id 里的起点才是真的，按它算。
+            startStateTicker(sessionId: sessionId, fromStart: true)
+        case .resume:
+            if tickerRunning { setCapturePaused(false) }
+            else { startStateTicker(sessionId: sessionId, fromStart: true) }
+        case .pause:
+            // 挂起 ≠ 停心跳：秒数还要继续走，只是 capture_state 变 SUSPENDED。
+            if tickerRunning { setCapturePaused(true) } else { stopStateTicker() }
+        case .stop, .notifyStopped:
             stopStateTicker()
         default:
             break
         }
     }
 
-    // MARK: - 每秒状态心跳（眼镜屏幕上的计时就是它驱动的）
+    // MARK: - 每秒采集状态（眼镜屏幕上的秒数是手机算好推过去的）
 
     @Published private(set) var stateTicks = 0
     @Published private(set) var tickerRunning = false
+    /// 屏幕上应该显示多少秒。由「现在 − 会话起点」算，不是自己数。
+    @Published private(set) var elapsedSeconds = 0
+    @Published private(set) var capturePaused = false
 
     private var stateTimer: Timer?
-    private var stateSeq = 0
     private var activeSessionId: [UInt8] = []
 
-    /// 官方抓包里手机每秒发一条 `SAGENOTE_STATE`，序号递增（01→02→03…）。
-    /// 停掉它就等于告诉眼镜"采集停了"，屏幕上的时长会停住。
-    func startStateTicker(sessionId: [UInt8]) {
+    // 会话起点：优先用 session id 里的毫秒戳（眼镜自己写的），解不出来才退回"现在"。
+    private var sessionStart = Date()
+    private var sessionStartMsEpoch: Int = 0
+    private var sessionStartFromId = false
+
+    /// 从 `mt-<ms>-<n>` 里解出真实起始时间。
+    ///
+    /// 坑：眼镜写的这个毫秒戳**是本地墙钟当 UTC 编码**的 ——
+    /// `mt-1795127062381` 若按 UTC 解是 22:24:22 UTC，而它其实发生在
+    /// 本地 22:24:22（GMT+8）。所以要减掉 `secondsFromGMT`。
+    /// 交叉验证：同一场的备份文件名 `INMOAUD_1795098262381` 正好比它小 8 小时，是标准 epoch。
+    static func sessionStartDate(from id: [UInt8]) -> Date? {
+        let s = String(decoding: id, as: UTF8.self)
+        guard s.hasPrefix("mt-") else { return nil }
+        let parts = s.dropFirst(3).split(separator: "-")
+        guard let ms = parts.first.flatMap({ Double($0) }), ms > 1_000_000_000_000 else { return nil }
+        let offset = Double(TimeZone.current.secondsFromGMT())
+        return Date(timeIntervalSince1970: ms / 1000.0 - offset)
+    }
+
+    /// 官方每 200~1000ms 发一条 `SAGENOTE_STATE`，里面是**已录秒数**。
+    /// 屏幕上的数字直接取这个值，所以停掉它就等于把计时冻住。
+    func startStateTicker(sessionId: [UInt8], fromStart: Bool = true) {
         if tickerRunning, sessionId == activeSessionId { return }
         stopStateTicker()
 
         activeSessionId = sessionId
-        stateSeq = 0
         stateTicks = 0
-        sessionStart = Date()
+        capturePaused = false
+
+        if fromStart, let d = GO3Central.sessionStartDate(from: sessionId) {
+            sessionStart = d
+            sessionStartFromId = true
+            let elapsed = Int(Date().timeIntervalSince(d))
+            append("  ⏱ 会话起点取自 session id：\(GO3Central.stamp.string(from: d))"
+                   + "（距今 \(elapsed / 60) 分 \(elapsed % 60) 秒）")
+            if elapsed > 120 {
+                append("     ⚠ 距今已经超过 2 分钟 —— 这是上一场的残留会话，屏幕会从一个很大的数开始。先 STOP 再重开。")
+            }
+        } else {
+            sessionStart = Date()
+            sessionStartFromId = false
+        }
+        sessionStartMsEpoch = Int(Date().timeIntervalSince1970 * 1000)
+
         tickerRunning = true
-        append("  ⏱ 开始每秒状态心跳（session=\(String(decoding: sessionId, as: UTF8.self))）—— 眼镜屏幕上的计时靠它推进")
+        append("  ⏱ 开始每秒采集状态（session=\(String(decoding: sessionId, as: UTF8.self))）—— 屏幕上的秒数由我们推的 elapsed_seconds 决定")
 
         let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.tick()
@@ -524,28 +605,38 @@ final class GO3Central: NSObject, ObservableObject {
         stateTimer?.invalidate()
         stateTimer = nil
         if tickerRunning {
-            append("  ⏱ 停止状态心跳（共 \(stateTicks) 条）")
+            append("  ⏱ 停止采集状态（共 \(stateTicks) 条）")
         }
         tickerRunning = false
     }
 
+    /// 挂起 / 恢复：不动计时，只改 capture_state。
+    /// 22:24 那场眼镜自己就发过 `capture_state=2(SUSPENDED)`，
+    /// 说明"暂停"是 SUPPENDED 而不是"停掉心跳"。
+    func setCapturePaused(_ paused: Bool) {
+        capturePaused = paused
+        append("  ⏱ 采集状态切到 \(paused ? "SUSPENDED 挂起" : "ACTIVE 采集中")（计时继续走）")
+        tick()
+    }
+
     private func tick() {
         guard let ch = targetChannel else { return }
-        stateSeq += 1
         stateTicks += 1
-        let payload = SagenoteOut.state(sessionId: activeSessionId, seq: stateSeq)
+        elapsedSeconds = max(0, Int(Date().timeIntervalSince(sessionStart)))
+        let payload = SagenoteOut.state(sessionId: activeSessionId,
+                                        elapsedSeconds: elapsedSeconds,
+                                        capture: capturePaused ? .suspended : .active)
         // 每秒一条，全打日志会刷屏：前 3 条留痕，之后静默，靠界面上的计数看。
         if stateTicks <= 3 {
-            append("  ⏱ 状态 #\(stateSeq)")
+            append("  ⏱ 状态 elapsed=\(elapsedSeconds)s \(capturePaused ? "SUSPENDED" : "ACTIVE")")
         }
-        sendPayload(payload, ch: ch, label: "SAGENOTE STATE #\(stateSeq)",
+        sendPayload(payload, ch: ch, label: "SAGENOTE STATE elapsed=\(elapsedSeconds)",
                     quiet: stateTicks > 3)
     }
 
     // MARK: - 手动注入识别结果（验证回传通道用）
 
     private var asrSegmentId = 0
-    private var sessionStart = Date()
 
     /// 把一段文字当成 ASR 结果发给眼镜。
     /// 用途：此刻我们还没有真正的语音识别，但可以先验证"手机→眼镜的文字回传通道"通不通。

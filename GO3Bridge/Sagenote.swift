@@ -81,6 +81,9 @@ struct SagenoteIn {
     let cmd: Int?
     let source: Int?
     let captureState: Int?
+    /// `SagenoteState.f4 = elapsed_seconds`，即眼镜**自己算的已录秒数**。
+    /// 这一条是判断"23 分钟"从哪来的直接证据：眼镜报多少，屏幕上就显示多少。
+    let elapsedSeconds: Int?
 
     var typeName: String { SagenoteMsg(rawValue: msgType)?.name ?? "未知(\(msgType))" }
     var commandIdStr: String { String(decoding: commandId, as: UTF8.self) }
@@ -106,11 +109,18 @@ struct SagenoteIn {
             source = Pb.first(f, 2)?.asInt
         }
         var capture: Int?
+        var elapsed: Int?
         if let st = Pb.first(s, 13), st.wire == 2 {
-            capture = Pb.first(Pb.parse(st.bytes), 1)?.asInt
+            let f = Pb.parse(st.bytes)
+            // SagenoteState{ f1=mode, f2=record_type, f3=capture_state,
+            //                 f4=elapsed_seconds, f5=error }
+            // 注意 f3 是采集状态，不是"序号"——P11 把这里当成递增序号，是错的。
+            capture = Pb.first(f, 3)?.asInt
+            elapsed = Pb.first(f, 4)?.asInt
         }
         return SagenoteIn(msgType: msgType, commandId: commandId, sessionId: sessionId,
-                          cmd: cmd, source: source, captureState: capture)
+                          cmd: cmd, source: source, captureState: capture,
+                          elapsedSeconds: elapsed)
     }
 
     var summary: String {
@@ -123,6 +133,10 @@ struct SagenoteIn {
         }
         if let cs = captureState {
             parts.append("采集=\(SagenoteCapture(rawValue: cs)?.name ?? "?")")
+        }
+        if let es = elapsedSeconds {
+            let mm = es / 60, ss = es % 60
+            parts.append(String(format: "眼镜认为已录 %d:%02d", mm, ss))
         }
         if !sessionId.isEmpty { parts.append("session=\(sessionIdStr)") }
         return parts.joined(separator: " ")
@@ -190,18 +204,23 @@ enum SagenoteOut {
 
     /// 手机主动下发一条会记命令（START / STOP / PAUSE / RESUME）。
     ///
-    /// 结构是照 ACK 反推的：
-    /// `Sagenote{ f1=COMMAND(0), f2=commandId, f3=sessionId, f4=now_ms, f10=Command{ f1=cmd, f2=source } }`
-    /// `source` 取 0=手机。`commandId` 用字符串，眼镜会原样回在 ACK 里，可以据此对账。
+    /// 结构（反编译 `SagenoteProto.SagenoteCommand`，`SagenoteProto.java:2911-2919`）：
+    /// `f1=cmd, f2=source, f3=start_timestamp_ms`，装在 `Sagenote.f10` 里；
+    /// 外层 `Sagenote{ f1=COMMAND(0), f2=commandId, f3=sessionId, f4=now_ms }`。
+    ///
+    /// `source`：0=手机 / 1=眼镜 / 2=系统。我们下发就用 0。
+    /// `startTimestampMs` 只有 START 用得上：眼镜拿它当这一场的**计时起点**，
+    /// 所以「23 分钟」那种残留就是靠 START + 正确起点盖掉的。
     ///
     /// **诚实标注**：官方抓包（`INTEL/sniff.log` 手机→眼镜方向）里没有 COMMAND 样本，
-    /// 只有 ACK / STATE / ASR / 外层包裹这四类逐字节对过。所以这条是**推定结构**，
-    /// 界面上标成「试验」，发完要看眼镜屏幕有没有反应，别当成已证实的结论。
+    /// 逐字节对过的只有 ACK / STATE / ASR / 外层包裹四类。这条是**按反编译字段推定**的，
+    /// 界面上因此标成「试验」，发完要看眼镜屏幕反应，别当已证实结论。
     static func command(cmd: Int, sessionId: [UInt8], commandId: String,
-                        source: Int = 0) -> [UInt8] {
+                        source: Int = 0, startTimestampMs: Int? = nil) -> [UInt8] {
         var c: [UInt8] = []
         c += PbW.int(1, cmd)
         c += PbW.int(2, source)
+        if let ts = startTimestampMs { c += PbW.int(3, ts) }
 
         var body: [UInt8] = []
         body += PbW.int(1, SagenoteMsg.command.rawValue)
@@ -221,22 +240,29 @@ enum SagenoteOut {
         return out
     }
 
-    /// 每秒一条的「采集状态心跳」。
+    /// 每秒一条的「采集状态」。**这是眼镜屏幕上那个计时的唯一数据源。**
     ///
-    /// **这是眼镜屏幕上那个计时器的驱动源。** 官方抓包里手机每秒发一条：
-    /// `08 03 | 1a 12 "mt-…" | 20 <ts> | 6a 0a 08 01 10 01 18 01 20 02 2a 00`
-    /// 其中 `18 01` 那个数是**逐秒递增**的序号（抓包里 01→02→04→05…→1a）。
-    /// 我们从来不发，所以眼镜进了会记界面也一直显示 00:00 —— 这就是「不计时」的根因。
-    static func state(sessionId: [UInt8], seq: Int) -> [UInt8] {
+    /// 反编译 `SagenoteProto.SagenoteState`（`SagenoteProto.java:7284`，字段常量 7285-7291）：
+    /// `f1=mode(1) f2=record_type(2) f3=capture_state(3) f4=elapsed_seconds(4) f5=error(5)`。
+    /// 官方抓包原文 `6a 0a 08 01 10 01 18 01 20 02 2a 00` 逐字段即：
+    /// `f1=1(MEETING) f2=1(RECORD_MEETING) f3=1(ACTIVE) f4=2(已录 2 秒) f5=""`。
+    ///
+    /// **P11 这里写错了**：把 f3 当成"递增序号"，f4 恒写 2。于是眼镜收到的是
+    /// 「采集状态 = 第 N 秒」+「已录永远 2 秒」。那个 `01→02→04→05…→1a` 不是序号，
+    /// 是 elapsed_seconds 1、2、4、5…26 —— 当时看走了眼。
+    static func state(sessionId: [UInt8], commandId: String = "",
+                      elapsedSeconds: Int, capture: SagenoteCapture = .active) -> [UInt8] {
         var st: [UInt8] = []
-        st += PbW.int(1, SagenoteCapture.active.rawValue)   // 采集中
-        st += PbW.int(2, 1)
-        st += PbW.int(3, seq)                                // 递增序号
-        st += PbW.int(4, 2)
-        st += PbW.bytes(5, [])                               // 官方也带这个空串
+        st += PbW.int(1, 1)                     // mode = 1 (MEETING)
+        st += PbW.int(2, 1)                     // record_type = 1 (RECORD_MEETING)
+        st += PbW.int(3, capture.rawValue)      // capture_state 0 IDLE / 1 ACTIVE / 2 SUSPENDED
+        st += PbW.int(4, max(0, elapsedSeconds))// elapsed_seconds —— 屏幕上的数字就是它
+        st += PbW.bytes(5, [])                  // error = 空（官方样本 `2a 00`）
 
         var body: [UInt8] = []
         body += PbW.int(1, SagenoteMsg.state.rawValue)
+        // commandId：回 QUERY 时要原样回显，眼镜靠它对账；常规心跳留空。
+        if !commandId.isEmpty { body += PbW.string(2, commandId) }
         body += PbW.bytes(3, sessionId)
         body += PbW.int(4, Int(Date().timeIntervalSince1970 * 1000))
         body += PbW.bytes(13, st)

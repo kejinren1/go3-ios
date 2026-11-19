@@ -254,8 +254,8 @@ struct RootView: View {
                     .fill(ble.tickerRunning ? Color.green : Color.secondary.opacity(0.4))
                     .frame(width: 8, height: 8)
                 Text(ble.tickerRunning
-                     ? "状态心跳：运行中，已发 \(ble.stateTicks) 条（眼镜的计时靠它）"
-                     : "状态心跳：未运行（等眼镜发 START/RESUME）")
+                     ? "采集状态：运行中，已推 \(ble.stateTicks) 条 · 屏幕应显示 \(ble.elapsedSeconds / 60):\(String(format: "%02d", ble.elapsedSeconds % 60))\(ble.capturePaused ? " · 已挂起" : "")"
+                     : "采集状态：未运行（等眼镜发 START / NOTIFY_STARTED，或点上面 START）")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
